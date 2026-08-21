@@ -145,18 +145,30 @@ exports the model in the formats a phone would need.
 
 You need Python 3.10 or newer.
 
+Windows, in PowerShell:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+macOS or Linux:
+
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Be aware that the install pulls in PyTorch, which is a large download.
+If PowerShell refuses to run the activate script, run
+`Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` first. Be aware
+that the install pulls in PyTorch, which is a large download.
 
 To try it without a car, a phone or a trained model, start the server in one
 terminal and the simulator in another:
 
-```bash
-POTHOLESENSE_STUB=1 python run.py &
+```powershell
+$env:POTHOLESENSE_STUB=1; python run.py
 python scripts/simulate_drive.py --frames 120 --potholes 6 --oracle
 ```
 
@@ -164,7 +176,7 @@ Then open `http://localhost:8000/dashboard` and watch the pins appear.
 
 To use it in a car, start it with `--https`:
 
-```bash
+```powershell
 python run.py --https
 ```
 
@@ -174,7 +186,8 @@ camera or GPS over an ordinary connection. It prints an address like
 same network as the laptop. Your browser will warn you about the certificate,
 which is expected, because the certificate is one your own laptop just made up
 rather than one bought from a certificate authority. Accept it, allow the camera
-and location, and press Start survey.
+and location, and press Start survey. If the page will not load at all it is
+usually Windows Firewall blocking the connection.
 
 ### Setting it up for your car
 

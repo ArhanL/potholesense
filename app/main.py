@@ -44,12 +44,12 @@ def _startup():
 # ---------------------------------------------------------------- pages ----
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return (STATIC_DIR / "capture.html").read_text()
+    return (STATIC_DIR / "capture.html").read_text(encoding="utf-8")
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    return (STATIC_DIR / "dashboard.html").read_text()
+    return (STATIC_DIR / "dashboard.html").read_text(encoding="utf-8")
 
 
 @app.get("/health")
