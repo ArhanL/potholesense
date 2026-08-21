@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>PotholeSense — Capture</title>
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#161d26; --line:#26313d;
+    --text:#e6edf3; --muted:#8b98a5;
+    --accent:#4ade80; --warn:#fbbf24; --danger:#f87171;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
+    font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    overscroll-behavior:none}
+  #stage{position:relative;width:100%;height:62vh;background:#000;overflow:hidden}
+  video,canvas#overlay{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  canvas#overlay{pointer-events:none}
+  #badge{position:absolute;top:12px;left:12px;padding:6px 12px;border-radius:999px;
+    background:rgba(0,0,0,.6);backdrop-filter:blur(8px);font-size:13px;font-weight:600;
+    display:flex;align-items:center;gap:8px}
+  #dot{width:9px;height:9px;border-radius:50%;background:var(--muted)}
+  #dot.live{background:var(--danger);animation:pulse 1.2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+  #hit{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    font-size:clamp(28px,9vw,56px);font-weight:800;color:var(--danger);
+    text-shadow:0 2px 16px #000;opacity:0;transition:opacity .15s}
+  #hit.show{opacity:1}
+  .wrap{padding:14px;display:flex;flex-direction:column;gap:12px}
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:10px;text-align:center}
+  .stat b{display:block;font-size:22px;line-height:1.1}
+  .stat span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+  button{width:100%;padding:16px;border:0;border-radius:14px;font-size:17px;
+    font-weight:700;color:#04120a;background:var(--accent)}
+  button.stop{background:var(--danger);color:#1a0505}
+  button:disabled{opacity:.4}
+  #log{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:10px;font-size:12px;color:var(--muted);max-height:22vh;overflow:auto;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  #log div{padding:2px 0;border-bottom:1px solid rgba(255,255,255,.04)}
+  a{color:var(--accent)}
+  .row{display:flex;gap:10px;align-items:center;justify-content:space-between;
+    font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="cam" playsinline muted autoplay></video>
+  <canvas id="overlay"></canvas>
+  <div id="badge"><span id="dot"></span><span id="state">idle</span></div>
+  <div id="hit">POTHOLE</div>
+</div>
+
+<div class="wrap">
+  <div class="grid">
+    <div class="stat"><b id="s-found">0</b><span>potholes</span></div>
+    <div class="stat"><b id="s-fps">0.0</b><span>fps</span></div>
+    <div class="stat"><b id="s-ms">—</b><span>infer ms</span></div>
+  </div>
+  <div class="row">
+    <span id="gps">GPS: waiting…</span>
+    <a href="/dashboard" target="_blank">Open map ↗</a>
+  </div>
+  <button id="go">Start survey</button>
+  <div id="log"><div>Ready. Mount the phone before starting.</div></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const video = $('cam'), overlay = $('overlay'), octx = overlay.getContext('2d');
+const grab = document.createElement('canvas'), gctx = grab.getContext('2d');
+
+const TARGET_FPS = 3;          // frames sent per second
+const SEND_WIDTH = 640;        // downscale before upload
+const JPEG_Q = 0.62;
+
+let running = false, sessionId = null, stream = null, wakeLock = null;
+let fix = null, watchId = null, inflight = false;
+let sent = 0, fpsMark = performance.now(), fpsCount = 0;
+const seen = new Set();
+
+function log(msg){
+  const d = document.createElement('div');
+  d.textContent = new Date().toLocaleTimeString() + '  ' + msg;
+  $('log').prepend(d);
+  while ($('log').children.length > 60) $('log').lastChild.remove();
+}
+
+async function startCamera(){
+  stream = await navigator.mediaDevices.getUserMedia({
+    video:{ facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:720} },
+    audio:false
+  });
+  video.srcObject = stream;
+  await video.play();
+  overlay.width = video.videoWidth; overlay.height = video.videoHeight;
+  log(`camera ${video.videoWidth}x${video.videoHeight}`);
+}
+
+function startGPS(){
+  if(!navigator.geolocation){ log('ERROR no geolocation'); return; }
+  watchId = navigator.geolocation.watchPosition(p => {
+    fix = p.coords;
+    $('gps').textContent =
+      `GPS: ${p.coords.latitude.toFixed(5)}, ${p.coords.longitude.toFixed(5)} ` +
+      `(±${Math.round(p.coords.accuracy)}m)`;
+  }, e => log('GPS error: ' + e.message),
+     { enableHighAccuracy:true, maximumAge:1000, timeout:10000 });
+}
+
+function drawBoxes(dets, fw, fh){
+  octx.clearRect(0,0,overlay.width,overlay.height);
+  const sx = overlay.width/fw, sy = overlay.height/fh;
+  octx.lineWidth = 4; octx.strokeStyle = '#f87171';
+  octx.font = 'bold 20px sans-serif'; octx.fillStyle = '#f87171';
+  dets.forEach(d => {
+    const [x1,y1,x2,y2] = d.bbox;
+    octx.strokeRect(x1*sx, y1*sy, (x2-x1)*sx, (y2-y1)*sy);
+    octx.fillText(`${d.severity} ${d.confidence}`, x1*sx, Math.max(22, y1*sy - 8));
+  });
+}
+
+function flash(){
+  $('hit').classList.add('show');
+  if (navigator.vibrate) navigator.vibrate(120);
+  setTimeout(()=>$('hit').classList.remove('show'), 450);
+}
+
+async function sendFrame(){
+  if (!running || inflight || !fix || video.readyState < 2) return;
+  inflight = true;
+  try{
+    const scale = SEND_WIDTH / video.videoWidth;
+    grab.width = SEND_WIDTH; grab.height = Math.round(video.videoHeight*scale);
+    gctx.drawImage(video, 0, 0, grab.width, grab.height);
+    const blob = await new Promise(r => grab.toBlob(r, 'image/jpeg', JPEG_Q));
+
+    const fd = new FormData();
+    fd.append('image', blob, 'f.jpg');
+    fd.append('lat', fix.latitude);
+    fd.append('lon', fix.longitude);
+    if (fix.accuracy != null) fd.append('accuracy_m', fix.accuracy);
+    if (fix.speed != null && !isNaN(fix.speed)) fd.append('speed_mps', fix.speed);
+    if (fix.heading != null && !isNaN(fix.heading)) fd.append('heading_deg', fix.heading);
+    if (sessionId) fd.append('session_id', sessionId);
+
+    const res = await fetch('/api/frame', { method:'POST', body: fd });
+    if (res.status === 202){ inflight=false; return; }   // GPS too coarse
+    const data = await res.json();
+
+    sent++; fpsCount++;
+    $('s-ms').textContent = data.inference_ms;
+    drawBoxes(data.detections, data.frame.w, data.frame.h);
+
+    data.detections.forEach(d => {
+      if (d.new){
+        seen.add(d.pothole_id);
+        $('s-found').textContent = seen.size;
+        flash();
+        const rng = d.distance_m != null ? ` @${d.distance_m}m ahead` : '';
+        log(`NEW #${d.pothole_id} ${d.severity} conf ${d.confidence}${rng}`);
+      }
+    });
+  } catch(err){
+    log('upload failed: ' + err.message);
+  } finally { inflight = false; }
+}
+
+setInterval(() => {
+  const now = performance.now();
+  if (now - fpsMark >= 1000){
+    $('s-fps').textContent = (fpsCount * 1000/(now-fpsMark)).toFixed(1);
+    fpsCount = 0; fpsMark = now;
+  }
+}, 1000);
+
+async function start(){
+  try{
+    await startCamera();
+    startGPS();
+    const fd = new FormData();
+    fd.append('device', navigator.userAgent.slice(0,120));
+    sessionId = (await (await fetch('/api/session/start',{method:'POST',body:fd})).json()).session_id;
+    if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen').catch(()=>null);
+    running = true;
+    $('go').textContent = 'Stop survey'; $('go').classList.add('stop');
+    $('dot').classList.add('live'); $('state').textContent = 'surveying';
+    log(`session ${sessionId} started`);
+    loop();
+  }catch(e){ log('start failed: ' + e.message); }
+}
+
+function loop(){
+  if(!running) return;
+  sendFrame();
+  setTimeout(loop, 1000/TARGET_FPS);
+}
+
+async function stop(){
+  running = false;
+  if (sessionId) await fetch(`/api/session/${sessionId}/end`, {method:'POST'});
+  if (watchId != null) navigator.geolocation.clearWatch(watchId);
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (wakeLock) { try{ await wakeLock.release(); }catch(e){} wakeLock = null; }
+  octx.clearRect(0,0,overlay.width,overlay.height);
+  $('go').textContent = 'Start survey'; $('go').classList.remove('stop');
+  $('dot').classList.remove('live'); $('state').textContent = 'idle';
+  log(`stopped — ${sent} frames, ${seen.size} potholes`);
+}
+
+$('go').onclick = () => running ? stop() : start();
+</script>
+</body>
+</html>

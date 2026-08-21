@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PotholeSense — Dashboard</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🔴</text></svg>">
+<!-- Leaflet is vendored locally so the dashboard works with no internet
+     connection (useful in a car, and it removes a CDN dependency). -->
+<link rel="stylesheet" href="/static/vendor/leaflet.css"/>
+<script src="/static/vendor/leaflet.js"></script>
+<style>
+  :root{--bg:#0b0f14;--panel:#161d26;--line:#26313d;--text:#e6edf3;--muted:#8b98a5;
+        --high:#f87171;--med:#fbbf24;--low:#60a5fa;--accent:#4ade80}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
+    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  #app{display:grid;grid-template-columns:340px 1fr;height:100%}
+  aside{background:var(--panel);border-right:1px solid var(--line);
+    padding:18px;overflow:auto;display:flex;flex-direction:column;gap:16px}
+  h1{margin:0;font-size:19px;letter-spacing:-.01em}
+  h1 span{color:var(--accent)}
+  .sub{color:var(--muted);font-size:12px;margin-top:2px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .stat{background:#0f151d;border:1px solid var(--line);border-radius:10px;padding:12px}
+  .stat b{display:block;font-size:26px;line-height:1.1}
+  .stat span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+  .sevrow{display:flex;gap:6px}
+  .pill{flex:1;text-align:center;border-radius:8px;padding:8px 4px;font-size:12px;font-weight:700;color:#0b0f14}
+  .pill.h{background:var(--high)} .pill.m{background:var(--med)} .pill.l{background:var(--low)}
+  #map{height:100%}
+  .btn{display:block;text-align:center;padding:11px;border-radius:10px;text-decoration:none;
+    font-weight:600;font-size:14px;border:1px solid var(--line);color:var(--text);background:#0f151d}
+  .btn.primary{background:var(--accent);color:#04120a;border-color:var(--accent)}
+  ul{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:6px}
+  li{background:#0f151d;border:1px solid var(--line);border-radius:9px;padding:9px 11px;
+    font-size:13px;cursor:pointer}
+  li:hover{border-color:var(--accent)}
+  li .ref{font-weight:700} li .meta{color:var(--muted);font-size:11px}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+  .leaflet-popup-content{font:13px/1.4 sans-serif}
+  .leaflet-popup-content img{width:100%;border-radius:6px;margin-top:6px}
+  @media(max-width:800px){#app{grid-template-columns:1fr;grid-template-rows:auto 60vh}}
+</style>
+</head>
+<body>
+<div id="app">
+  <aside>
+    <div>
+      <h1>Pothole<span>Sense</span></h1>
+      <div class="sub">Automated road defect survey</div>
+    </div>
+    <div class="grid">
+      <div class="stat"><b id="k-pot">0</b><span>Potholes</span></div>
+      <div class="stat"><b id="k-det">0</b><span>Detections</span></div>
+      <div class="stat"><b id="k-frm">0</b><span>Frames</span></div>
+      <div class="stat"><b id="k-ms">—</b><span>Avg ms</span></div>
+    </div>
+    <div class="sevrow">
+      <div class="pill h">HIGH <span id="k-h">0</span></div>
+      <div class="pill m">MED <span id="k-m">0</span></div>
+      <div class="pill l">LOW <span id="k-l">0</span></div>
+    </div>
+    <a class="btn primary" href="/api/export/pdf">Download council report (PDF)</a>
+    <a class="btn" href="/api/export/csv">Export CSV</a>
+    <div>
+      <div class="sub" style="margin-bottom:6px">Detected defects</div>
+      <ul id="list"></ul>
+    </div>
+  </aside>
+  <div id="map"></div>
+</div>
+<script>
+const COLOURS = {high:'#f87171', medium:'#fbbf24', low:'#60a5fa'};
+
+// The map is a progressive enhancement: if Leaflet or the tile server is
+// unavailable (offline laptop, blocked network) the statistics, defect list
+// and exports must still work.
+let map = null, layer = null;
+try {
+  map = L.map('map').setView([51.4545,-2.5879], 13);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+    {maxZoom:19, attribution:'© OpenStreetMap'}).addTo(map);
+  layer = L.layerGroup().addTo(map);
+} catch (e) {
+  document.getElementById('map').innerHTML =
+    '<div style="padding:24px;color:#8b98a5">Map unavailable (offline). ' +
+    'Defect list and exports still work.</div>';
+}
+const markers = {};
+let fitted = false;
+
+function popup(p){
+  const img = p.evidence
+    ? `<img src="/evidence/${p.evidence}" alt="evidence">` : '';
+  return `<b>PS-${String(p.id).padStart(5,'0')}</b><br>
+    Severity: <b style="color:${COLOURS[p.severity]}">${p.severity.toUpperCase()}</b><br>
+    Seen ${p.sightings}×, confidence ${p.max_conf.toFixed(2)}<br>
+    <a href="https://www.google.com/maps?q=${p.lat},${p.lon}" target="_blank">Open in Maps ↗</a>
+    ${img}`;
+}
+
+async function refresh(){
+ try {
+  const [pot, st] = await Promise.all([
+    fetch('/api/potholes').then(r=>r.json()),
+    fetch('/api/stats').then(r=>r.json())
+  ]);
+  k('k-pot', st.potholes); k('k-det', st.detections);
+  k('k-frm', st.frames_processed); k('k-ms', st.avg_inference_ms || '—');
+  k('k-h', st.high); k('k-m', st.medium); k('k-l', st.low);
+
+  const list = document.getElementById('list');
+  list.innerHTML = '';
+  const bounds = [];
+
+  pot.potholes.forEach(p => {
+    bounds.push([p.lat, p.lon]);
+    if(layer){
+      if(!markers[p.id]){
+        markers[p.id] = L.circleMarker([p.lat,p.lon], {
+          radius: p.severity==='high'?11:p.severity==='medium'?8:6,
+          color:'#0b0f14', weight:2, fillColor:COLOURS[p.severity], fillOpacity:.9
+        }).addTo(layer);
+      }
+      markers[p.id].setLatLng([p.lat,p.lon]).setStyle({fillColor:COLOURS[p.severity]});
+      markers[p.id].bindPopup(popup(p));
+    }
+
+    const li = document.createElement('li');
+    li.innerHTML = `<span class="ref"><span class="dot" style="background:${COLOURS[p.severity]}"></span>
+      PS-${String(p.id).padStart(5,'0')}</span>
+      <div class="meta">${p.lat.toFixed(5)}, ${p.lon.toFixed(5)} — ${p.severity}, seen ${p.sightings}×</div>`;
+    li.onclick = () => {
+      if(!map) return;
+      map.setView([p.lat,p.lon], 18);
+      if(markers[p.id]) markers[p.id].openPopup();
+    };
+    list.appendChild(li);
+  });
+
+  if(map && bounds.length && !fitted){
+    map.fitBounds(bounds, {padding:[50,50], maxZoom:17});
+    fitted = true;
+  }
+ } catch (err) {
+   console.error('refresh failed', err);
+ }
+}
+const k = (id,v) => document.getElementById(id).textContent = v;
+refresh();
+setInterval(refresh, 3000);   // live-updates while a survey is running
+</script>
+</body>
+</html>
