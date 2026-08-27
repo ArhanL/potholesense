@@ -19,6 +19,31 @@
 
 export const INPUT_SIZE = 640;
 
+const RUNTIME_URL = '/static/vendor/ort/ort.wasm.min.js';
+let runtimeLoading = null;
+
+/* Pull in ONNX Runtime Web on first use.
+ *
+ * It ships as a classic script that assigns a global, not an ES module, so it
+ * is injected rather than imported. Deliberately lazy: a phone surveying in
+ * server mode never runs a model and should not pay 11 MB to find that out,
+ * and the service worker caches it on the first on-device run so later drives
+ * need no network at all. */
+function ensureRuntime() {
+  if (globalThis.ort) return Promise.resolve(globalThis.ort);
+  if (runtimeLoading) return runtimeLoading;
+  runtimeLoading = new Promise((resolve, reject) => {
+    const tag = document.createElement('script');
+    tag.src = RUNTIME_URL;
+    tag.onload = () => globalThis.ort
+      ? resolve(globalThis.ort)
+      : reject(new Error('runtime loaded but exposed no ort global'));
+    tag.onerror = () => reject(new Error(`could not load ${RUNTIME_URL}`));
+    document.head.appendChild(tag);
+  });
+  return runtimeLoading;
+}
+
 /* Letterbox to a square: resize preserving aspect ratio, pad the remainder.
  * Squashing the frame instead would distort every box, and the whole
  * downstream geometry - distance, width, severity - depends on box edges
@@ -124,6 +149,7 @@ export class OnDeviceDetector {
     this.confThreshold = confThreshold;
     this.iouThreshold = iouThreshold;
     this.session = null;
+    this.ort = null;
     this.threads = 1;
 
     this.canvas = document.createElement('canvas');
@@ -133,7 +159,7 @@ export class OnDeviceDetector {
   }
 
   async load(onProgress) {
-    const ort = globalThis.ort;
+    const ort = await ensureRuntime();
     ort.env.wasm.wasmPaths = '/static/vendor/ort/';
     // Threads need SharedArrayBuffer, which needs a cross-origin isolated
     // page. The server sets COOP/COEP for exactly this; if something strips
@@ -161,6 +187,7 @@ export class OnDeviceDetector {
     let at = 0;
     for (const c of chunks) { bytes.set(c, at); at += c.length; }
 
+    this.ort = ort;
     this.session = await ort.InferenceSession.create(bytes, {
       executionProviders: ['wasm'],
       graphOptimizationLevel: 'all',
@@ -177,7 +204,7 @@ export class OnDeviceDetector {
     const sw = video.videoWidth, sh = video.videoHeight;
     const { scale, dx, dy } = letterbox(video, sw, sh, this.ctx);
     const rgba = this.ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
-    const tensor = new globalThis.ort.Tensor(
+    const tensor = new this.ort.Tensor(
       'float32', toTensorData(rgba, this.buffer), [1, 3, INPUT_SIZE, INPUT_SIZE]);
 
     const started = performance.now();
