@@ -94,6 +94,14 @@ def main() -> int:
     ap.add_argument("--match-radius", type=float, default=15.0)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--grow", type=float, default=1.0,
+                    help="scale every defect's size, simulating deterioration "
+                         "since the last survey")
+    ap.add_argument("--repair", type=int, default=0,
+                    help="remove this many defects before driving, simulating "
+                         "repairs carried out since the last survey")
+    ap.add_argument("--diff", action="store_true",
+                    help="print what changed versus previous surveys")
     ap.add_argument("--oracle", action="store_true",
                     help="bypass the detector and push ground-truth boxes, "
                          "isolating localisation + deduplication error")
@@ -110,12 +118,19 @@ def main() -> int:
         if along > route_len - 5:
             break
         lateral = rng.uniform(-1.4, 1.4)
-        radius = rng.uniform(MIN_RADIUS_M, MAX_RADIUS_M)
+        radius = rng.uniform(MIN_RADIUS_M, MAX_RADIUS_M) * args.grow
         width = 2 * radius
         lat, lon = offset_latlon(*ROUTE_START, HEADING_DEG, along, lateral)
         truth.append({"along": along, "lateral": lateral, "lat": lat, "lon": lon,
                       "radius": radius, "width_m": width,
                       "severity": classify(width, width)})
+
+    if args.repair:
+        # Repairs are carried out on the defects the route reaches first, so a
+        # re-survey drives the same road and simply stops finding them.
+        repaired = truth[:args.repair]
+        truth = truth[args.repair:]
+        print(f"{len(repaired)} defect(s) repaired since the last survey")
 
     sess = requests.Session()
     sid = sess.post(f"{args.server}/api/session/start",
@@ -141,6 +156,15 @@ def main() -> int:
         heading = HEADING_DEG + rng.uniform(-2, 2)
 
         if args.oracle:
+            # Report the position every frame, not only when something is
+            # seen. Coverage is what lets a later survey tell a repaired
+            # pothole from a road it never drove down.
+            try:
+                sess.post(f"{args.server}/api/track", data={
+                    "lat": car_lat, "lon": car_lon,
+                    "accuracy_m": rng.uniform(4, 8), "session_id": sid}, timeout=30)
+            except Exception:
+                pass
             for forward, lateral, radius in visible:
                 bx, by = bbox_for(forward, lateral, radius)
                 try:
@@ -235,6 +259,27 @@ def main() -> int:
     print(f"  Frames sent             : {sent} ({errors} errors)")
     print(f"  Avg inference           : {st['avg_inference_ms']} ms")
     print("=" * 52)
+    if args.diff:
+        d = sess.get(f"{args.server}/api/survey/{sid}/diff").json()
+        print("\n" + "=" * 52)
+        print("  CHANGE SINCE PREVIOUS SURVEYS")
+        print("=" * 52)
+        c = d["counts"]
+        print(f"  Vehicle track points    : {d['track_points']}")
+        print(f"  New defects             : {c['new']}")
+        print(f"  Deteriorated            : {c['worse']}")
+        print(f"  Unchanged               : {c['unchanged']}")
+        print(f"  Presumed repaired       : {c['fixed']}")
+        print(f"  Not surveyed this time  : {c['not_surveyed']}")
+        for w in d["worse"]:
+            print(f"    #{w['id']} widened "
+                  f"{w['previous_width_m']:.2f} -> {w['current_width_m']:.2f} m "
+                  f"(+{w['growth_m']*100:.0f} cm, needed "
+                  f"{w['growth_threshold_m']*100:.0f} cm)")
+        for f_ in d["fixed"]:
+            print(f"    #{f_['id']} no longer detected on a road we drove")
+        print("=" * 52)
+
     print(f"\nOpen {args.server}/dashboard")
     return 0 if (fn == 0 and fp == 0) else 1
 

@@ -47,8 +47,22 @@ CREATE TABLE IF NOT EXISTS detections (
     length_m      REAL,
     distance_m    REAL,
     accuracy_m    REAL,
-    speed_mps     REAL
+    speed_mps     REAL,
+    session_id    INTEGER
 );
+CREATE INDEX IF NOT EXISTS idx_detections_session ON detections(session_id);
+CREATE INDEX IF NOT EXISTS idx_detections_pothole ON detections(pothole_id);
+
+-- Where the vehicle actually went, so a later survey can tell "this defect
+-- was not detected" (it may be gone) from "we never drove past it".
+CREATE TABLE IF NOT EXISTS track (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL,
+    ts         TEXT NOT NULL,
+    lat        REAL NOT NULL,
+    lon        REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_track_session ON track(session_id);
 
 CREATE TABLE IF NOT EXISTS sessions (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,7 +100,8 @@ def connect():
 # earlier survey keeps working instead of failing on a missing column.
 _MIGRATIONS = {
     "potholes": {"width_m": "REAL", "length_m": "REAL", "road_name": "TEXT"},
-    "detections": {"width_m": "REAL", "length_m": "REAL", "distance_m": "REAL"},
+    "detections": {"width_m": "REAL", "length_m": "REAL", "distance_m": "REAL",
+                   "session_id": "INTEGER"},
 }
 
 
@@ -264,10 +279,10 @@ def record_detection(
         conn.execute(
             """INSERT INTO detections
                (pothole_id, ts, lat, lon, confidence, area_fraction,
-                width_m, length_m, distance_m, accuracy_m, speed_mps)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                width_m, length_m, distance_m, accuracy_m, speed_mps, session_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (pothole_id, _now(), lat, lon, confidence, area_fraction,
-             width_m, length_m, distance_m, accuracy_m, speed_mps),
+             width_m, length_m, distance_m, accuracy_m, speed_mps, session_id),
         )
         row = conn.execute("SELECT * FROM potholes WHERE id=?", (pothole_id,)).fetchone()
         return {"created": created, **dict(row)}
@@ -282,6 +297,76 @@ def potholes_missing_road_name() -> list[dict]:
     with connect() as conn:
         return [dict(r) for r in conn.execute(
             "SELECT * FROM potholes WHERE road_name IS NULL OR road_name='' ORDER BY id")]
+
+
+# --------------------------------------------------------------- track ----
+# One point every TRACK_MIN_SPACING_M, not one per frame: at 3 fps and 30 mph
+# a per-frame track would be 10,000 rows for a 15-minute drive and would tell
+# us nothing extra. What matters is only which stretches of road were covered.
+TRACK_MIN_SPACING_M = 8.0
+_track_tail: dict[int, tuple[float, float]] = {}
+
+
+def record_track_point(session_id: int | None, lat: float, lon: float) -> bool:
+    """Log where the vehicle was. Returns True if the point was kept."""
+    if session_id is None:
+        return False
+    prev = _track_tail.get(session_id)
+    if prev is not None and haversine_m(prev[0], prev[1], lat, lon) < TRACK_MIN_SPACING_M:
+        return False
+    _track_tail[session_id] = (lat, lon)
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO track (session_id, ts, lat, lon) VALUES (?,?,?,?)",
+            (session_id, _now(), lat, lon))
+    return True
+
+
+def track_points(session_id: int) -> list[tuple[float, float]]:
+    with connect() as conn:
+        return [(r["lat"], r["lon"]) for r in conn.execute(
+            "SELECT lat, lon FROM track WHERE session_id=? ORDER BY id", (session_id,))]
+
+
+def sessions() -> list[dict]:
+    with connect() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM sessions ORDER BY id")]
+
+
+def detections_for_session(session_id: int) -> list[dict]:
+    with connect() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM detections WHERE session_id=? ORDER BY id", (session_id,))]
+
+
+def sessions_that_saw(pothole_id: int) -> list[int]:
+    """Session ids that recorded this defect, oldest first."""
+    with connect() as conn:
+        return [r["session_id"] for r in conn.execute(
+            """SELECT session_id, MIN(id) AS first_id FROM detections
+               WHERE pothole_id=? AND session_id IS NOT NULL
+               GROUP BY session_id ORDER BY first_id""", (pothole_id,))]
+
+
+def width_samples_in_session(pothole_id: int, session_id: int) -> list[float]:
+    """Every individual width measurement of this defect in this survey.
+
+    Several sightings per pass is what makes a change detectable: the spread
+    across them is a direct estimate of the measurement noise, so growth can
+    be tested against the instrument's own precision instead of a threshold
+    picked by hand.
+    """
+    with connect() as conn:
+        return [r["width_m"] for r in conn.execute(
+            """SELECT width_m FROM detections
+               WHERE pothole_id=? AND session_id=? AND width_m IS NOT NULL""",
+            (pothole_id, session_id))]
+
+
+def mean_width_in_session(pothole_id: int, session_id: int) -> float | None:
+    samples = width_samples_in_session(pothole_id, session_id)
+    return sum(samples) / len(samples) if samples else None
 
 
 def all_potholes(status: str | None = None) -> list[dict]:
@@ -325,8 +410,10 @@ def reset(delete_evidence: bool = True) -> None:
     """Wipe all data - handy when re-running demos."""
     with connect() as conn:
         conn.executescript(
-            "DELETE FROM detections; DELETE FROM potholes; DELETE FROM sessions;"
+            "DELETE FROM detections; DELETE FROM potholes; "
+            "DELETE FROM sessions; DELETE FROM track;"
         )
+    _track_tail.clear()
     if delete_evidence:
         for f in EVIDENCE_DIR.glob("*.jpg"):
             try:

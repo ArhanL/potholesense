@@ -318,3 +318,77 @@ def test_geocode_parses_a_real_nominatim_reply(monkeypatch):
     monkeypatch.setattr(geocode, "MIN_INTERVAL_S", 0.0)
     monkeypatch.setattr(geocode.urllib.request, "urlopen", fake_urlopen)
     assert geocode.road_name(51.454502, -2.587903) == "Whiteladies Road, Clifton"
+
+
+# ------------------------------------------------- repeat-survey diffing ----
+def _drive_past(db, session_id, lat, lon, width_m, passes=6, detect=True):
+    """Simulate driving past a point, optionally seeing a defect there."""
+    for i in range(passes):
+        along = (i - passes / 2) * 6.0 / 111_320.0     # a few metres of track
+        db.record_track_point(session_id, lat + along, lon)
+        if detect:
+            db.record_detection(lat, lon, 0.9, 0.01,
+                                width_m=width_m + (i % 2) * 0.005,
+                                length_m=width_m, session_id=session_id)
+
+
+def test_first_survey_reports_everything_as_new(db):
+    from app import survey
+    s1 = db.start_session("test")
+    _drive_past(db, s1, 51.4545, -2.5879, 0.40)
+    d = survey.diff_session(s1)
+    assert d["counts"]["new"] == 1
+    assert d["counts"]["worse"] == d["counts"]["fixed"] == 0
+
+
+def test_identical_resurvey_reports_no_change(db):
+    """The control that matters: driving the same road twice with nothing
+    altered must not manufacture deterioration."""
+    from app import survey
+    s1 = db.start_session("test")
+    _drive_past(db, s1, 51.4545, -2.5879, 0.40)
+    s2 = db.start_session("test")
+    _drive_past(db, s2, 51.4545, -2.5879, 0.40)
+    d = survey.diff_session(s2)
+    assert d["counts"]["unchanged"] == 1
+    assert d["counts"]["worse"] == 0
+    assert d["counts"]["new"] == 0
+
+
+def test_a_defect_that_grew_is_reported_as_worse(db):
+    from app import survey
+    s1 = db.start_session("test")
+    _drive_past(db, s1, 51.4545, -2.5879, 0.35)
+    s2 = db.start_session("test")
+    _drive_past(db, s2, 51.4545, -2.5879, 0.75)
+    d = survey.diff_session(s2)
+    assert d["counts"]["worse"] == 1
+    assert d["worse"][0]["growth_m"] > d["worse"][0]["growth_threshold_m"]
+
+
+def test_repaired_defect_is_fixed_only_if_we_drove_past_it(db):
+    """'Fixed' is an argument from absence, so it must be backed by coverage."""
+    from app import survey
+    s1 = db.start_session("test")
+    _drive_past(db, s1, 51.4545, -2.5879, 0.40)
+
+    # Re-survey the same road, detecting nothing.
+    s2 = db.start_session("test")
+    _drive_past(db, s2, 51.4545, -2.5879, 0.40, detect=False)
+    assert survey.diff_session(s2)["counts"]["fixed"] == 1
+
+    # Survey a different road entirely: the defect is unknown, not repaired.
+    s3 = db.start_session("test")
+    _drive_past(db, s3, 52.9000, -1.5000, 0.40, detect=False)
+    d3 = survey.diff_session(s3)
+    assert d3["counts"]["fixed"] == 0
+    assert d3["counts"]["not_surveyed"] == 1
+
+
+def test_growth_threshold_adapts_to_measurement_spread(db):
+    """A noisier set of measurements must demand more growth before the
+    change is called real."""
+    from app.survey import _mean_and_sem
+    tight = _mean_and_sem([0.40, 0.40, 0.41, 0.40, 0.40])
+    noisy = _mean_and_sem([0.30, 0.50, 0.35, 0.48, 0.38])
+    assert noisy[1] > tight[1]

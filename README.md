@@ -192,7 +192,7 @@ and restart; `/health` confirms which weights loaded.
 ## Tests
 
 ```bash
-python -m pytest tests/ -v      # 41 tests: geometry, sizing, dedup, severity
+python -m pytest tests/ -v      # 51 tests: geometry, sizing, dedup, severity, diffing
 ```
 
 ## Project layout
@@ -204,11 +204,64 @@ python -m pytest tests/ -v      # 41 tests: geometry, sizing, dedup, severity
 | `app/detector.py` | YOLO wrapper, lazy loading, thread-safe |
 | `app/baseline.py` | Classical CV detector — benchmark control |
 | `app/severity.py` | Metric severity banding against council criteria |
+| `app/survey.py` | Repeat-survey differencing - new / worse / fixed |
 | `app/geocode.py` | Reverse geocoding - coordinate to road name |
 | `app/reports.py` | Council PDF dossier + CSV export |
 | `app/static/capture.html` | Phone client: camera, GPS, live overlay |
 | `app/static/dashboard.html` | Live map, stats, exports |
 | `scripts/simulate_drive.py` | Closed-loop evaluation harness |
+
+## Driving the same road again
+
+One survey tells a council what is wrong today. Driving the same road a month
+later tells them what is *changing*, which is the thing they cannot get from a
+resident's report:
+
+```
+====================================================
+  CHANGE SINCE PREVIOUS SURVEYS
+====================================================
+  Vehicle track points    : 95
+  New defects             : 0
+  Deteriorated            : 7
+  Unchanged               : 1
+  Presumed repaired       : 2
+  Not surveyed this time  : 0
+    #6 widened 0.93 -> 1.19 m (+27 cm, needed 3 cm)
+    #8 widened 0.41 -> 0.53 m (+12 cm, needed 3 cm)
+    #1 no longer detected on a road we drove
+====================================================
+```
+
+Two things make this more than a diff.
+
+**"Fixed" is an argument from absence, so it needs coverage.** Not seeing a
+pothole only means it is gone if you actually drove past where it was. Every
+survey logs the vehicle's track (one point per 8 m, not per frame), and a
+defect is called `fixed` only when this survey's track passed within 25 m of
+it and nothing was detected. A defect on a road we did not drive is reported
+as `not_surveyed` — an honest answer rather than a flattering one. Clients
+that run the model themselves report position through `POST /api/track` on
+frames with no detection, so coverage is recorded whether or not there was
+anything to see.
+
+**Deterioration is tested against the instrument's own precision.** A fixed
+threshold would be the wrong tool: 3 cm of growth means something different on
+a 25 cm defect than on a 1 m one, and how much it means depends on how
+precisely that defect was measured. Each pass yields several independent width
+measurements, so their spread estimates the noise directly. Growth is only
+called real when it exceeds twice the combined standard error of the two
+means — which is why the threshold above varies from 3 cm to 7 cm per defect.
+Re-running an identical survey produces **zero** deteriorations, which is the
+control that matters.
+
+Try it against the harness:
+
+```bash
+python scripts/simulate_drive.py --frames 220 --potholes 10 --oracle          # baseline
+python scripts/simulate_drive.py --frames 220 --potholes 10 --oracle \
+       --grow 1.3 --repair 2 --diff                                           # a month later
+```
 
 ## Naming the street
 
@@ -256,4 +309,3 @@ you publish clips, blur faces and number plates.
 
 - On-device TFLite inference (weights already export; `POST /api/detection` already accepts them)
 - Depth estimation for true severity, via monocular depth models or stereo from consecutive frames
-- Repeat-survey differencing: which potholes are new, which got worse, which were fixed

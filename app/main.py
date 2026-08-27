@@ -19,7 +19,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, PlainTextResponse,
 from fastapi.staticfiles import StaticFiles
 
 from config import EVIDENCE_DIR, DATA_DIR, MIN_GPS_ACCURACY_M, CONF_THRESHOLD
-from app import storage, reports, geocode
+from app import storage, reports, geocode, survey
 from app.detector import get_detector
 from app.severity import bbox_area_fraction
 from app.localise import locate_detection, measure_defect, bearing_between
@@ -124,6 +124,9 @@ def ingest_frame(
     _stats["infer_ms_total"] += infer_ms
     if session_id:
         storage.bump_frames(session_id)
+        # Record where we drove, so a later survey can distinguish "this
+        # defect is gone" from "we never came back down this road".
+        storage.record_track_point(session_id, lat, lon)
 
     heading = _resolve_heading(session_id, lat, lon, heading_deg)
 
@@ -240,6 +243,7 @@ def ingest_detection(
     detector accuracy.
     """
     bbox = (x1, y1, x2, y2)
+    storage.record_track_point(session_id, lat, lon)
     heading = _resolve_heading(session_id, lat, lon, heading_deg)
     p_lat, p_lon, gp = locate_detection(bbox, frame_w, frame_h, lat, lon, heading)
     area = bbox_area_fraction(bbox, frame_w, frame_h)
@@ -296,6 +300,44 @@ def geocode_potholes(limit: int = 200):
             named += 1
     return {"considered": len(pending), "named": named,
             "unresolved": len(pending) - named}
+
+
+@app.post("/api/track")
+def ingest_track(
+    lat: float = Form(...),
+    lon: float = Form(...),
+    accuracy_m: float | None = Form(None),
+    session_id: int | None = Form(None),
+):
+    """Report the vehicle's position for a frame that produced no detection.
+
+    Needed by any client that runs the model itself and therefore only posts
+    detections: without this, the track would have a hole everywhere the road
+    was clear, and a defect repaired since the last survey would be reported
+    as 'not surveyed' rather than 'fixed'. Coverage is the evidence that
+    absence means anything, so it has to be reported whether or not there was
+    something to see.
+    """
+    if accuracy_m is not None and accuracy_m > MIN_GPS_ACCURACY_M:
+        return {"recorded": False, "reason": "gps_accuracy"}
+    return {"recorded": storage.record_track_point(session_id, lat, lon)}
+
+
+@app.get("/api/sessions")
+def list_sessions():
+    return {"sessions": storage.sessions()}
+
+
+@app.get("/api/survey/{session_id}/diff")
+def survey_diff(session_id: int):
+    """What changed in this survey compared with everything before it.
+
+    Verdicts are new, worse, unchanged, fixed and not_surveyed. 'fixed' is
+    only claimed where this survey's track actually passed the defect - a
+    pothole on a road we did not drive is reported as not_surveyed rather
+    than quietly counted as repaired.
+    """
+    return survey.diff_session(session_id)
 
 
 @app.get("/api/stats")
