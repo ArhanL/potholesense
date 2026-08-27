@@ -41,13 +41,32 @@ DEFAULT_SPEED_MPS = 11.0   # assumed when the phone reports no speed
 MIN_GPS_ACCURACY_M = 50.0  # reject fixes worse than this
 
 # --- Severity ----------------------------------------------------------
-# Severity is derived from apparent size of the pothole in frame combined
-# with detector confidence. Tuned against UK council reporting bands.
-SEVERITY_BANDS = {
-    "low": 0.0,
-    "medium": 0.035,   # bbox area as fraction of frame
-    "high": 0.085,
+# Severity is banded on the defect's measured width across the carriageway,
+# in metres, recovered by projecting the bounding box onto the road plane
+# (see app/localise.measure_defect).
+#
+# The thresholds are anchored to how UK highway authorities actually decide.
+# The most commonly specified intervention level for a carriageway pothole is
+# 40 mm deep by 300 mm wide; a 2018 RAC Foundation survey of local highway
+# authorities found 40 mm depth used by 56% of them, with "40 mm deep, 300 mm
+# wide" the most common depth-and-width pairing. Depth cannot be recovered
+# from a single monocular frame, so width is the criterion we can measure:
+#
+#   low     < 0.30 m   below the usual intervention width
+#   medium  0.30-0.60 m  meets the common 300 mm intervention width
+#   high    >= 0.60 m    twice it - wide enough to span a wheel track
+#
+# Reporting a width in metres against a published criterion is defensible to
+# a council in a way that "7% of the image" is not.
+SEVERITY_WIDTH_BANDS_M = {
+    "medium": 0.30,
+    "high": 0.60,
 }
+
+# A measurement is only as good as the geometry behind it. Beyond this range
+# the bounding box is a few pixels tall and the size estimate is not worth
+# banding on, so such sightings inform position but not severity.
+SEVERITY_MAX_RANGE_M = 25.0
 
 for _d in (DATA_DIR, EVIDENCE_DIR, MODELS_DIR):
     _d.mkdir(parents=True, exist_ok=True)

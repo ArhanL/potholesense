@@ -109,6 +109,55 @@ def bearing_between(lat1: float, lon1: float, lat2: float, lon2: float) -> float
     return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
 
 
+@dataclass
+class DefectSize:
+    """Physical extent of a defect on the road plane, in metres."""
+    width_m: float         # across the carriageway
+    length_m: float        # along the direction of travel
+    distance_m: float      # to the near edge
+    reliable: bool         # False if the geometry could not be trusted
+
+
+def measure_defect(bbox, frame_w: int, frame_h: int,
+                   camera_height_m: float = CAMERA_HEIGHT_M,
+                   pitch_deg: float = CAMERA_PITCH_DEG) -> DefectSize:
+    """Recover a defect's real-world size from its bounding box.
+
+    Apparent size in pixels is useless as a severity measure: the same 0.9 m
+    pothole covers 0.7% of the frame at 5 m and 0.003% at 30 m - a factor of
+    200. Ranking on it ranks how close the car happened to get.
+
+    Projecting the box onto the road plane removes the dependence. The bottom
+    corners give the two ends of the defect's leading edge, so their lateral
+    separation is its width across the carriageway; the bottom and top edges
+    give the near and far ground distances, whose difference is its length
+    along the direction of travel.
+
+    Length is the weaker of the two. Beyond ~20 m a defect spans only one or
+    two pixels vertically, so quantisation dominates; width stays good to
+    within a few centimetres out to MAX_RANGE_M. When the far edge cannot be
+    trusted we fall back to assuming the defect is roughly as long as it is
+    wide, which is true of most potholes.
+    """
+    x1, y1, x2, y2 = bbox
+    near_l = image_to_ground(x1, y2, frame_w, frame_h, camera_height_m, pitch_deg)
+    near_r = image_to_ground(x2, y2, frame_w, frame_h, camera_height_m, pitch_deg)
+    far_c = image_to_ground((x1 + x2) / 2.0, y1, frame_w, frame_h,
+                            camera_height_m, pitch_deg)
+
+    if not (near_l.reliable and near_r.reliable):
+        return DefectSize(0.0, 0.0, near_l.distance_m, False)
+
+    width = abs(near_r.lateral_m - near_l.lateral_m)
+    near_d = (near_l.distance_m + near_r.distance_m) / 2.0
+
+    if far_c.reliable and far_c.distance_m > near_d:
+        length = far_c.distance_m - near_d
+    else:
+        length = width                      # assume roughly circular
+    return DefectSize(width, length, near_d, True)
+
+
 def locate_detection(bbox, frame_w: int, frame_h: int,
                      car_lat: float, car_lon: float, heading_deg: float | None):
     """Full pipeline: bbox -> estimated pothole (lat, lon, distance, reliable).

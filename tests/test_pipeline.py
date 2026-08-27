@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.geo import haversine_m, bbox_around
 from app.localise import (image_to_ground, ground_to_image, offset_latlon,
-                          bearing_between, locate_detection)
+                          bearing_between, locate_detection, measure_defect)
 from app.severity import bbox_area_fraction, classify, priority_rank
 from app import storage, baseline
 from config import MAX_RANGE_M
@@ -107,21 +107,78 @@ def test_bbox_area_fraction():
     assert bbox_area_fraction((0, 0, 320, 240), 640, 480) == pytest.approx(0.25)
 
 
+# ------------------------------------------------------- defect sizing ----
+def _synthetic_bbox(distance_m, half_width_m, W=640, H=480):
+    """Bounding box of a defect of known size at a known distance."""
+    cx, _ = ground_to_image(distance_m, 0.0, W, H)
+    xr, _ = ground_to_image(distance_m, half_width_m, W, H)
+    _, y_near = ground_to_image(max(distance_m - half_width_m, 0.5), 0.0, W, H)
+    _, y_far = ground_to_image(distance_m + half_width_m, 0.0, W, H)
+    return (cx - abs(xr - cx), min(y_near, y_far), cx + abs(xr - cx),
+            max(y_near, y_far))
+
+
+@pytest.mark.parametrize("distance", [5.0, 10.0, 18.0, 25.0])
+def test_measured_width_is_independent_of_distance(distance):
+    """The whole point: the same defect must measure the same size whether it
+    is 5 m or 25 m ahead. Apparent size in pixels varies ~200x over that
+    range, which is why it cannot be used for severity."""
+    bbox = _synthetic_bbox(distance, 0.45)
+    size = measure_defect(bbox, 640, 480)
+    assert size.reliable
+    assert size.width_m == pytest.approx(0.90, abs=0.12)
+
+
+def test_apparent_size_would_have_varied_wildly():
+    """Guards the reason the rewrite happened - if this ever stops being true
+    the frame-fraction approach was not as broken as claimed."""
+    near = bbox_area_fraction(_synthetic_bbox(5.0, 0.45), 640, 480)
+    far = bbox_area_fraction(_synthetic_bbox(30.0, 0.45), 640, 480)
+    assert near / far > 50
+
+
+def test_unmeasurable_box_is_not_reliable():
+    size = measure_defect((300, 2, 340, 6), 640, 480)   # up near the horizon
+    assert not size.reliable
+
+
+# ------------------------------------------------------------ severity ----
+def test_severity_bands_on_measured_width():
+    assert classify(0.15, 0.15) == "low"        # 15 cm - below intervention
+    assert classify(0.35, 0.35) == "medium"     # meets the 300 mm criterion
+    assert classify(0.80, 0.80) == "high"
+
+
 def test_severity_is_monotonic_in_size():
-    assert classify(0.001, 0.9) == "low"
-    assert classify(0.05, 0.9) == "medium"
-    assert classify(0.15, 0.9) == "high"
+    order = {"low": 0, "medium": 1, "high": 2}
+    widths = [0.10, 0.25, 0.31, 0.45, 0.61, 1.20]
+    scores = [order[classify(w, w)] for w in widths]
+    assert scores == sorted(scores)
 
 
-def test_repeat_sightings_can_raise_severity():
-    a = classify(0.080, 0.9, sightings=1)
-    b = classify(0.080, 0.9, sightings=5)
-    assert (a, b) == ("medium", "high")
+def test_elongated_defect_rated_on_its_longer_axis():
+    assert classify(0.20, 0.90) == "high"
+
+
+def test_unreliable_geometry_returns_unknown_not_a_guess():
+    assert classify(None, None, reliable=False) == "unknown"
+    assert classify(0.8, 0.8, distance_m=200.0) == "unknown"
+
+
+def test_severity_no_longer_depends_on_confidence():
+    """Confidence is about the detector, not about the road. It may reorder
+    the report but must not change what a defect is classified as."""
+    assert classify(0.35, 0.35) == classify(0.35, 0.35)
+    assert priority_rank("medium", 1, 0.99) > priority_rank("medium", 1, 0.10)
 
 
 def test_priority_orders_high_before_low():
     assert priority_rank("high", 1) > priority_rank("medium", 10)
     assert priority_rank("medium", 1) > priority_rank("low", 10)
+
+
+def test_unknown_severity_ranks_last():
+    assert priority_rank("unknown", 10) < priority_rank("low", 1)
 
 
 # ------------------------------------------------------------- storage ----
@@ -134,19 +191,19 @@ def db():
 
 
 def test_first_detection_creates_pothole(db):
-    r = db.record_detection(51.4545, -2.5879, 0.8, 0.05)
+    r = db.record_detection(51.4545, -2.5879, 0.8, 0.05, width_m=0.35, length_m=0.35)
     assert r["created"] and r["sightings"] == 1
 
 
 def test_nearby_detections_merge(db):
-    db.record_detection(51.4545, -2.5879, 0.8, 0.05)
-    r = db.record_detection(51.45451, -2.58791, 0.85, 0.06)   # ~1.5 m away
+    db.record_detection(51.4545, -2.5879, 0.8, 0.05, width_m=0.35, length_m=0.35)
+    r = db.record_detection(51.45451, -2.58791, 0.85, 0.06, width_m=0.36, length_m=0.36)   # ~1.5 m away
     assert not r["created"] and r["sightings"] == 2
     assert db.stats()["potholes"] == 1
 
 
 def test_distant_detections_stay_separate(db):
-    db.record_detection(51.4545, -2.5879, 0.8, 0.05)
+    db.record_detection(51.4545, -2.5879, 0.8, 0.05, width_m=0.35, length_m=0.35)
     r = db.record_detection(51.4600, -2.5879, 0.8, 0.05)      # ~610 m away
     assert r["created"]
     assert db.stats()["potholes"] == 2
@@ -179,7 +236,7 @@ def test_a_full_pass_collapses_to_one_pothole(db):
 
 
 def test_mark_reported(db):
-    r = db.record_detection(51.4545, -2.5879, 0.8, 0.05)
+    r = db.record_detection(51.4545, -2.5879, 0.8, 0.05, width_m=0.35, length_m=0.35)
     assert db.mark_reported([r["id"]]) == 1
     assert db.all_potholes(status="new") == []
     assert len(db.all_potholes(status="reported")) == 1

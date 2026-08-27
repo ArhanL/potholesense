@@ -33,11 +33,18 @@ geospatial proximity, averages positions across sightings (which cancels GPS
 jitter rather than compounding it), and keeps only the highest-confidence
 evidence photo.
 
-**3. Councils need prioritisation, not a data dump.**
-Severity is estimated from apparent defect size in frame weighted by detector
-confidence and corroborated across independent sightings, then used to rank the
-generated report. The method is deliberately simple and explainable — a council
-has to be able to justify why one hole was fixed before another.
+**3. Councils need prioritisation, and "big in the image" is not a size.**
+The same 0.9 m pothole covers 0.7% of the frame at 5 m and 0.003% at 30 m — a
+factor of 200. Rank on apparent size and you have ranked how close the car
+happened to get, not how bad the road is. PotholeSense projects the bounding
+box onto the road plane and reports the defect's **width in metres**
+(`app/severity.py`), which is stable to about 2 cm across the usable range.
+That number can then be banded against a council's own published criterion
+rather than an arbitrary one: the most common UK intervention level for a
+carriageway pothole is 40 mm deep by 300 mm wide, so 300 mm is where `medium`
+begins. Detector confidence and repeat sightings order defects *within* a band
+but can never move one across a band — the physical measurement always
+dominates, which is what makes the ordering defensible.
 
 ## Results
 
@@ -48,15 +55,18 @@ the car's own fix. The server sees only imagery and noisy GPS.
 
 Separating geometry error from detector error is the point of the harness:
 
-| Configuration | Precision | Recall | F1 | Mean localisation error |
-|---|---|---|---|---|
-| **Oracle detector** (isolates localisation + dedup) | **1.00** | **1.00** | **1.00** | **1.1 m** |
-| Classical CV baseline (`app/baseline.py`) | 0.30 | 0.50 | 0.37 | 8.2 m |
-| Fine-tuned YOLOv8n | *run the notebook* | | | |
+| Configuration | Precision | Recall | F1 | Localisation error | Width error | Severity band |
+|---|---|---|---|---|---|---|
+| **Oracle detector** (isolates localisation + dedup) | **1.00** | **1.00** | **1.00** | **0.9 m** | **2 cm** | **9/10** |
+| Classical CV baseline (`app/baseline.py`) | 0.30 | 0.50 | 0.37 | 8.2 m | — | — |
+| Fine-tuned YOLOv8n | *run the notebook* | | | | | |
 
-The oracle row is the meaningful engineering result: given correct boxes, the
-pipeline recovers 6/6 pothole positions to **1.1 m mean error despite 4 m GPS
-noise**, because averaging repeat sightings cancels the jitter.
+The oracle row is the meaningful engineering result. Given correct boxes, the
+pipeline recovers 10/10 pothole positions to **0.9 m mean error despite 4 m of
+GPS noise**, because averaging repeat sightings cancels the jitter; and it
+measures their width to **2 cm mean error** (5 cm worst case) against defects
+seeded anywhere from 0.18 m to 1.00 m across, putting 9 of 10 into the correct
+severity band. The one miss sits within a few centimetres of a band boundary.
 
 The baseline row is the honest control. A hand-tuned OpenCV pipeline (CLAHE →
 adaptive threshold → contour shape filtering) reaches only F1 0.37 — it cannot
@@ -68,13 +78,15 @@ something.
 ====================================================
   END-TO-END LOCALISATION EVALUATION
 ====================================================
-  Ground-truth potholes   : 6
-  Unique potholes stored  : 6
-  Raw detections          : 41 (6.8 per pothole)
+  Ground-truth potholes   : 10
+  Unique potholes stored  : 10
+  Raw detections          : 72 (7.2 per pothole)
   Precision               : 1.00
   Recall                  : 1.00
   F1                      : 1.00
-  Localisation error      : mean 1.1 m, max 1.7 m
+  Localisation error      : mean 0.9 m, max 1.4 m
+  Width measurement error : mean 2 cm, max 5 cm
+  Severity band correct   : 9/10 (90%)
 ====================================================
 ```
 
@@ -121,7 +133,7 @@ pip install -r requirements.txt
 
 # Try it with no model and no car:
 POTHOLESENSE_STUB=1 python run.py &
-python scripts/simulate_drive.py --frames 120 --potholes 6 --oracle
+python scripts/simulate_drive.py --frames 220 --potholes 10 --oracle
 open http://localhost:8000/dashboard
 ```
 
@@ -134,7 +146,7 @@ pip install -r requirements.txt
 
 # Try it with no model and no car - run these in two terminals:
 $env:POTHOLESENSE_STUB=1; python run.py
-python scripts/simulate_drive.py --frames 120 --potholes 6 --oracle
+python scripts/simulate_drive.py --frames 220 --potholes 10 --oracle
 start http://localhost:8000/dashboard
 ```
 
@@ -180,7 +192,7 @@ and restart; `/health` confirms which weights loaded.
 ## Tests
 
 ```bash
-python -m pytest tests/ -v      # 31 tests: geometry round-trips, dedup, severity
+python -m pytest tests/ -v      # 41 tests: geometry, sizing, dedup, severity
 ```
 
 ## Project layout
@@ -191,7 +203,7 @@ python -m pytest tests/ -v      # 31 tests: geometry round-trips, dedup, severit
 | `app/storage.py` | SQLite + geospatial deduplication of repeat sightings |
 | `app/detector.py` | YOLO wrapper, lazy loading, thread-safe |
 | `app/baseline.py` | Classical CV detector — benchmark control |
-| `app/severity.py` | Explainable severity scoring and prioritisation |
+| `app/severity.py` | Metric severity banding against council criteria |
 | `app/reports.py` | Council PDF dossier + CSV export |
 | `app/static/capture.html` | Phone client: camera, GPS, live overlay |
 | `app/static/dashboard.html` | Live map, stats, exports |
@@ -201,9 +213,13 @@ python -m pytest tests/ -v      # 31 tests: geometry round-trips, dedup, severit
 
 Stated plainly, because an interviewer will ask:
 
-- **Severity is a proxy, not a measurement.** Depth cannot be recovered from a
-  single monocular frame. Apparent size correlates with severity but a large
-  shallow patch and a small deep hole can score alike.
+- **Width is measured; depth is not.** A single monocular frame contains no
+  depth information, so a wide shallow patch and a narrow deep hole are not
+  distinguished. Width is half of the usual 40 mm × 300 mm criterion, and the
+  report says so rather than implying a full assessment.
+- **Size accuracy depends on the camera calibration.** The measurement inherits
+  any error in the four numbers in `config.py`; a pitch that is 2° out biases
+  every distance, and therefore every width, in the same direction.
 - **Flat-ground assumption.** On a crest, dip or steep camber the projection
   degrades; error grows with distance, which is why estimates beyond 35 m are
   rejected outright.

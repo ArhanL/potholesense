@@ -25,28 +25,32 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.geo import haversine_m
 from app.localise import ground_to_image, offset_latlon
+from app.severity import classify
 from config import MIN_RANGE_M, MAX_RANGE_M
 
 ROUTE_START = (51.45450, -2.58790)     # Bristol
 HEADING_DEG = 35.0
-POTHOLE_RADIUS_M = 0.45                # typical defect ~0.9 m across
+# Defects are given a spread of real sizes so the run exercises every
+# severity band and can measure how accurately size is recovered - not just
+# whether the position is right.
+MIN_RADIUS_M, MAX_RADIUS_M = 0.09, 0.50       # 0.18 m to 1.00 m across
 FRAME_W, FRAME_H = 640, 480
 
 
-def bbox_for(forward: float, lateral: float):
+def bbox_for(forward: float, lateral: float, radius: float):
     """Ground-truth bounding box of a pothole at (forward, lateral) metres."""
     cx, cy = ground_to_image(forward, lateral, FRAME_W, FRAME_H)
-    xr, _ = ground_to_image(forward, lateral + POTHOLE_RADIUS_M, FRAME_W, FRAME_H)
-    _, y_near = ground_to_image(max(forward - POTHOLE_RADIUS_M, 0.5), lateral,
+    xr, _ = ground_to_image(forward, lateral + radius, FRAME_W, FRAME_H)
+    _, y_near = ground_to_image(max(forward - radius, 0.5), lateral,
                                 FRAME_W, FRAME_H)
-    _, y_far = ground_to_image(forward + POTHOLE_RADIUS_M, lateral, FRAME_W, FRAME_H)
+    _, y_far = ground_to_image(forward + radius, lateral, FRAME_W, FRAME_H)
     ax = max(3.0, abs(xr - cx))
     return (cx - ax, min(y_near, y_far), cx + ax, max(y_near, y_far)), None
 
 
 # ------------------------------------------------------------------ render --
 def render_frame(visible, rng) -> np.ndarray:
-    """Draw a road scene containing `visible` = [(forward_m, lateral_m), ...]."""
+    """Draw a road scene containing `visible` = [(forward, lateral, radius), ...]."""
     img = np.full((FRAME_H, FRAME_W, 3), 118, dtype=np.uint8)
     noise = np.random.default_rng(rng.randrange(1 << 30)).normal(0, 8, (FRAME_H, FRAME_W, 1))
     img = np.clip(img + noise, 0, 255).astype(np.uint8)
@@ -63,11 +67,11 @@ def render_frame(visible, rng) -> np.ndarray:
             pts.append([int(x), int(y)])
         cv2.polylines(img, [np.array(pts, np.int32)], False, (225, 225, 220), 3)
 
-    for forward, lateral in visible:
+    for forward, lateral, radius in visible:
         cx, cy = ground_to_image(forward, lateral, FRAME_W, FRAME_H)
-        xr, _ = ground_to_image(forward, lateral + POTHOLE_RADIUS_M, FRAME_W, FRAME_H)
-        _, y_near = ground_to_image(max(forward - POTHOLE_RADIUS_M, 0.5), lateral, FRAME_W, FRAME_H)
-        _, y_far = ground_to_image(forward + POTHOLE_RADIUS_M, lateral, FRAME_W, FRAME_H)
+        xr, _ = ground_to_image(forward, lateral + radius, FRAME_W, FRAME_H)
+        _, y_near = ground_to_image(max(forward - radius, 0.5), lateral, FRAME_W, FRAME_H)
+        _, y_far = ground_to_image(forward + radius, lateral, FRAME_W, FRAME_H)
         ax = max(3, int(abs(xr - cx)))
         ay = max(2, int(abs(y_near - y_far) / 2))
         if cy < horizon_y or cy > FRAME_H + 40:
@@ -106,8 +110,12 @@ def main() -> int:
         if along > route_len - 5:
             break
         lateral = rng.uniform(-1.4, 1.4)
+        radius = rng.uniform(MIN_RADIUS_M, MAX_RADIUS_M)
+        width = 2 * radius
         lat, lon = offset_latlon(*ROUTE_START, HEADING_DEG, along, lateral)
-        truth.append({"along": along, "lateral": lateral, "lat": lat, "lon": lon})
+        truth.append({"along": along, "lateral": lateral, "lat": lat, "lon": lon,
+                      "radius": radius, "width_m": width,
+                      "severity": classify(width, width)})
 
     sess = requests.Session()
     sid = sess.post(f"{args.server}/api/session/start",
@@ -119,7 +127,7 @@ def main() -> int:
     errors, sent = 0, 0
     for i in range(args.frames):
         travelled = i * step_m
-        visible = [(t["along"] - travelled, t["lateral"]) for t in truth
+        visible = [(t["along"] - travelled, t["lateral"], t["radius"]) for t in truth
                    if MIN_RANGE_M < (t["along"] - travelled) < MAX_RANGE_M]
         if not args.oracle:
             img = render_frame(visible, rng)
@@ -133,8 +141,8 @@ def main() -> int:
         heading = HEADING_DEG + rng.uniform(-2, 2)
 
         if args.oracle:
-            for forward, lateral in visible:
-                bx, by = bbox_for(forward, lateral)
+            for forward, lateral, radius in visible:
+                bx, by = bbox_for(forward, lateral, radius)
                 try:
                     r = sess.post(f"{args.server}/api/detection", data={
                         "lat": car_lat, "lon": car_lon, "confidence": 0.9,
@@ -183,10 +191,17 @@ def main() -> int:
          for ti, t in enumerate(truth) for pi, p in enumerate(stored)),
         key=lambda x: x[0])
     used_t, used_p, dists = set(), set(), []
+    size_errs, severity_hits, severity_judged = [], 0, 0
     for d, ti, pi in pairs:
         if d > args.match_radius or ti in used_t or pi in used_p:
             continue
         used_t.add(ti); used_p.add(pi); dists.append(d)
+        t, p = truth[ti], stored[pi]
+        if p.get("width_m"):
+            size_errs.append(abs(p["width_m"] - t["width_m"]))
+        if p["severity"] != "unknown":
+            severity_judged += 1
+            severity_hits += (p["severity"] == t["severity"])
 
     tp = len(dists)
     fn = len(truth) - tp
@@ -211,6 +226,12 @@ def main() -> int:
     if dists:
         print(f"  Localisation error      : mean {sum(dists)/len(dists):.1f} m, "
               f"max {max(dists):.1f} m")
+    if size_errs:
+        print(f"  Width measurement error : mean {sum(size_errs)/len(size_errs)*100:.0f} cm, "
+              f"max {max(size_errs)*100:.0f} cm")
+    if severity_judged:
+        print(f"  Severity band correct   : {severity_hits}/{severity_judged} "
+              f"({severity_hits/severity_judged:.0%})")
     print(f"  Frames sent             : {sent} ({errors} errors)")
     print(f"  Avg inference           : {st['avg_inference_ms']} ms")
     print("=" * 52)

@@ -17,8 +17,8 @@ from app import storage
 from app.severity import priority_rank
 
 CSV_COLUMNS = [
-    "reference", "latitude", "longitude", "severity", "priority",
-    "first_observed", "last_observed", "times_observed",
+    "reference", "latitude", "longitude", "severity", "width_m", "length_m",
+    "priority", "first_observed", "last_observed", "times_observed",
     "detector_confidence", "evidence_file", "google_maps_link",
 ]
 
@@ -31,7 +31,10 @@ def _rows(potholes: list[dict]) -> list[dict]:
             "latitude": round(p["lat"], 6),
             "longitude": round(p["lon"], 6),
             "severity": p["severity"],
-            "priority": round(priority_rank(p["severity"], p["sightings"]), 1),
+            "width_m": round(p["width_m"], 2) if p.get("width_m") else "",
+            "length_m": round(p["length_m"], 2) if p.get("length_m") else "",
+            "priority": round(priority_rank(p["severity"], p["sightings"],
+                                            p["max_conf"]), 1),
             "first_observed": p["first_seen"],
             "last_observed": p["last_seen"],
             "times_observed": p["sightings"],

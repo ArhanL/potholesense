@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS potholes (
     sightings     INTEGER NOT NULL DEFAULT 1,
     max_conf      REAL NOT NULL,
     area_fraction REAL NOT NULL,
+    width_m       REAL,
+    length_m      REAL,
     severity      TEXT NOT NULL,
     evidence      TEXT,
     status        TEXT NOT NULL DEFAULT 'new',
@@ -40,6 +42,9 @@ CREATE TABLE IF NOT EXISTS detections (
     lon           REAL NOT NULL,
     confidence    REAL NOT NULL,
     area_fraction REAL NOT NULL,
+    width_m       REAL,
+    length_m      REAL,
+    distance_m    REAL,
     accuracy_m    REAL,
     speed_mps     REAL
 );
@@ -76,9 +81,26 @@ def connect():
         conn.close()
 
 
+# Columns added after the first release. Applied to existing databases so an
+# earlier survey keeps working instead of failing on a missing column.
+_MIGRATIONS = {
+    "potholes": {"width_m": "REAL", "length_m": "REAL"},
+    "detections": {"width_m": "REAL", "length_m": "REAL", "distance_m": "REAL"},
+}
+
+
+def _migrate(conn) -> None:
+    for table, columns in _MIGRATIONS.items():
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in columns.items():
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
 
 
 def start_session(device: str = "unknown") -> int:
@@ -156,6 +178,10 @@ def record_detection(
     lon: float,
     confidence: float,
     area_fraction: float,
+    width_m: float | None = None,
+    length_m: float | None = None,
+    distance_m: float | None = None,
+    size_reliable: bool = True,
     evidence: str | None = None,
     accuracy_m: float | None = None,
     speed_mps: float | None = None,
@@ -178,14 +204,14 @@ def record_detection(
         if existing is None:
             if evidence_writer is not None and evidence is None:
                 evidence = evidence_writer()
-            severity = sev.classify(area_fraction, confidence, sightings=1)
+            severity = sev.classify(width_m, length_m, distance_m, size_reliable)
             cur = conn.execute(
                 """INSERT INTO potholes
                    (lat, lon, first_seen, last_seen, sightings, max_conf,
-                    area_fraction, severity, evidence, session_id)
-                   VALUES (?,?,?,?,1,?,?,?,?,?)""",
+                    area_fraction, width_m, length_m, severity, evidence, session_id)
+                   VALUES (?,?,?,?,1,?,?,?,?,?,?,?)""",
                 (lat, lon, _now(), _now(), confidence, area_fraction,
-                 severity, evidence, session_id),
+                 width_m, length_m, severity, evidence, session_id),
             )
             pothole_id = cur.lastrowid
             created = True
@@ -194,11 +220,25 @@ def record_detection(
             sightings = existing["sightings"] + 1
             max_conf = max(existing["max_conf"], confidence)
             max_area = max(existing["area_fraction"], area_fraction)
+            # Keep the best physical measurement, not the biggest-looking one.
+            # A closer sighting is a better measurement, so a reliable estimate
+            # supersedes an absent one and later reliable estimates are
+            # averaged in, which damps per-frame bounding-box jitter.
+            best_w, best_l = existing["width_m"], existing["length_m"]
+            if size_reliable and width_m:
+                if best_w is None:
+                    best_w, best_l = width_m, length_m
+                else:
+                    k = existing["sightings"]
+                    best_w = (best_w * k + width_m) / (k + 1)
+                    if best_l is not None and length_m:
+                        best_l = (best_l * k + length_m) / (k + 1)
             # Running mean position - repeated GPS fixes average out jitter.
             n = existing["sightings"]
             new_lat = (existing["lat"] * n + lat) / (n + 1)
             new_lon = (existing["lon"] * n + lon) / (n + 1)
-            severity = sev.classify(max_area, max_conf, sightings)
+            severity = sev.classify(best_w, best_l, distance_m,
+                                    reliable=best_w is not None)
             # Keep only the best view of each defect; discard the rest.
             evid = existing["evidence"]
             if confidence >= existing["max_conf"]:
@@ -213,17 +253,20 @@ def record_detection(
                 _delete_evidence(evidence)
             conn.execute(
                 """UPDATE potholes SET lat=?, lon=?, last_seen=?, sightings=?,
-                   max_conf=?, area_fraction=?, severity=?, evidence=? WHERE id=?""",
+                   max_conf=?, area_fraction=?, width_m=?, length_m=?,
+                   severity=?, evidence=? WHERE id=?""",
                 (new_lat, new_lon, _now(), sightings, max_conf, max_area,
-                 severity, evid, pothole_id),
+                 best_w, best_l, severity, evid, pothole_id),
             )
             created = False
 
         conn.execute(
             """INSERT INTO detections
-               (pothole_id, ts, lat, lon, confidence, area_fraction, accuracy_m, speed_mps)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (pothole_id, _now(), lat, lon, confidence, area_fraction, accuracy_m, speed_mps),
+               (pothole_id, ts, lat, lon, confidence, area_fraction,
+                width_m, length_m, distance_m, accuracy_m, speed_mps)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (pothole_id, _now(), lat, lon, confidence, area_fraction,
+             width_m, length_m, distance_m, accuracy_m, speed_mps),
         )
         row = conn.execute("SELECT * FROM potholes WHERE id=?", (pothole_id,)).fetchone()
         return {"created": created, **dict(row)}
@@ -258,7 +301,8 @@ def stats() -> dict:
                       COALESCE(SUM(sightings),0) AS sightings,
                       SUM(severity='high') AS high,
                       SUM(severity='medium') AS medium,
-                      SUM(severity='low') AS low
+                      SUM(severity='low') AS low,
+                      SUM(severity='unknown') AS unknown
                FROM potholes"""
         ).fetchone()
         dets = conn.execute("SELECT COUNT(*) AS c FROM detections").fetchone()["c"]

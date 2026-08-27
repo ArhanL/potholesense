@@ -22,7 +22,7 @@ from config import EVIDENCE_DIR, DATA_DIR, MIN_GPS_ACCURACY_M, CONF_THRESHOLD
 from app import storage, reports
 from app.detector import get_detector
 from app.severity import bbox_area_fraction
-from app.localise import locate_detection, bearing_between
+from app.localise import locate_detection, measure_defect, bearing_between
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -132,8 +132,13 @@ def ingest_frame(
         area = bbox_area_fraction(det.bbox, w, h)
         # Estimate where the pothole actually is, not where the car is.
         p_lat, p_lon, gp = locate_detection(det.bbox, w, h, lat, lon, heading)
+        # ...and how big it actually is, in metres, not in pixels.
+        size = measure_defect(det.bbox, w, h)
         rec = storage.record_detection(
             lat=p_lat, lon=p_lon, confidence=det.confidence, area_fraction=area,
+            width_m=size.width_m or None, length_m=size.length_m or None,
+            distance_m=size.distance_m if size.reliable else None,
+            size_reliable=size.reliable,
             accuracy_m=accuracy_m, speed_mps=speed_mps, session_id=session_id,
             evidence_writer=lambda f=frame, d=det: _save_evidence(f, d),
         )
@@ -147,6 +152,7 @@ def ingest_frame(
             "bbox": [round(v) for v in det.bbox],
             "distance_m": (round(gp.distance_m, 1)
                            if gp.distance_m != float("inf") else None),
+            "width_m": round(size.width_m, 2) if size.reliable else None,
             "range_reliable": gp.reliable,
         })
         if rec["created"]:
@@ -237,8 +243,12 @@ def ingest_detection(
     heading = _resolve_heading(session_id, lat, lon, heading_deg)
     p_lat, p_lon, gp = locate_detection(bbox, frame_w, frame_h, lat, lon, heading)
     area = bbox_area_fraction(bbox, frame_w, frame_h)
+    size = measure_defect(bbox, frame_w, frame_h)
     rec = storage.record_detection(
         lat=p_lat, lon=p_lon, confidence=confidence, area_fraction=area,
+        width_m=size.width_m or None, length_m=size.length_m or None,
+        distance_m=size.distance_m if size.reliable else None,
+        size_reliable=size.reliable,
         evidence=None, accuracy_m=accuracy_m, speed_mps=speed_mps,
         session_id=session_id,
     )
@@ -249,6 +259,7 @@ def ingest_detection(
         "pothole_id": rec["id"], "new": rec["created"],
         "severity": rec["severity"], "sightings": rec["sightings"],
         "distance_m": round(gp.distance_m, 1) if gp.distance_m != float("inf") else None,
+        "width_m": round(size.width_m, 2) if size.reliable else None,
         "range_reliable": gp.reliable,
     }
 
