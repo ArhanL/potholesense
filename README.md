@@ -204,10 +204,25 @@ python -m pytest tests/ -v      # 41 tests: geometry, sizing, dedup, severity
 | `app/detector.py` | YOLO wrapper, lazy loading, thread-safe |
 | `app/baseline.py` | Classical CV detector — benchmark control |
 | `app/severity.py` | Metric severity banding against council criteria |
+| `app/geocode.py` | Reverse geocoding - coordinate to road name |
 | `app/reports.py` | Council PDF dossier + CSV export |
 | `app/static/capture.html` | Phone client: camera, GPS, live overlay |
 | `app/static/dashboard.html` | Live map, stats, exports |
 | `scripts/simulate_drive.py` | Closed-loop evaluation harness |
+
+## Naming the street
+
+A report that says `51.454502, -2.587903` makes a highways officer do the work
+of finding the road. After a drive, **Look up road names** on the dashboard
+(or `POST /api/geocode`) resolves each defect to something like
+*Whiteladies Road, Clifton* via Nominatim.
+
+It runs on demand rather than during the survey, because the service allows one
+request per second and that has no place on the frame path. Defects within
+about 55 m of each other snap to the same grid cell and share one lookup, so a
+street's worth of potholes costs a single request. If the lookup fails - no
+signal, rate limited, service down - the defect keeps its coordinate and
+everything else still works.
 
 ## Limitations
 
@@ -241,5 +256,4 @@ you publish clips, blur faces and number plates.
 
 - On-device TFLite inference (weights already export; `POST /api/detection` already accepts them)
 - Depth estimation for true severity, via monocular depth models or stereo from consecutive frames
-- Road-name reverse geocoding so reports name the street
 - Repeat-survey differencing: which potholes are new, which got worse, which were fixed

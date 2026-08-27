@@ -19,7 +19,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, PlainTextResponse,
 from fastapi.staticfiles import StaticFiles
 
 from config import EVIDENCE_DIR, DATA_DIR, MIN_GPS_ACCURACY_M, CONF_THRESHOLD
-from app import storage, reports
+from app import storage, reports, geocode
 from app.detector import get_detector
 from app.severity import bbox_area_fraction
 from app.localise import locate_detection, measure_defect, bearing_between
@@ -276,6 +276,26 @@ def evidence(name: str):
 @app.get("/api/potholes")
 def list_potholes(status: str | None = None):
     return {"potholes": storage.all_potholes(status)}
+
+
+@app.post("/api/geocode")
+def geocode_potholes(limit: int = 200):
+    """Fill in road names for defects that do not have one yet.
+
+    Run after a drive, not during: reverse geocoding is a network round trip
+    per road and is rate-limited to one request a second, so it has no place
+    on the frame path. Defects within about 55 m of each other share a single
+    lookup. Anything that fails simply keeps its coordinate.
+    """
+    pending = storage.potholes_missing_road_name()[:limit]
+    named = 0
+    for p in pending:
+        name = geocode.road_name(p["lat"], p["lon"])
+        if name:
+            storage.set_road_name(p["id"], name)
+            named += 1
+    return {"considered": len(pending), "named": named,
+            "unresolved": len(pending) - named}
 
 
 @app.get("/api/stats")

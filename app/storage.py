@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS potholes (
     width_m       REAL,
     length_m      REAL,
     severity      TEXT NOT NULL,
+    road_name     TEXT,
     evidence      TEXT,
     status        TEXT NOT NULL DEFAULT 'new',
     session_id    INTEGER
@@ -84,7 +85,7 @@ def connect():
 # Columns added after the first release. Applied to existing databases so an
 # earlier survey keeps working instead of failing on a missing column.
 _MIGRATIONS = {
-    "potholes": {"width_m": "REAL", "length_m": "REAL"},
+    "potholes": {"width_m": "REAL", "length_m": "REAL", "road_name": "TEXT"},
     "detections": {"width_m": "REAL", "length_m": "REAL", "distance_m": "REAL"},
 }
 
@@ -270,6 +271,17 @@ def record_detection(
         )
         row = conn.execute("SELECT * FROM potholes WHERE id=?", (pothole_id,)).fetchone()
         return {"created": created, **dict(row)}
+
+
+def set_road_name(pothole_id: int, name: str | None) -> None:
+    with connect() as conn:
+        conn.execute("UPDATE potholes SET road_name=? WHERE id=?", (name, pothole_id))
+
+
+def potholes_missing_road_name() -> list[dict]:
+    with connect() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM potholes WHERE road_name IS NULL OR road_name='' ORDER BY id")]
 
 
 def all_potholes(status: str | None = None) -> list[dict]:

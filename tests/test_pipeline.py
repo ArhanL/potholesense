@@ -2,6 +2,7 @@
 
 Run with:  python -m pytest tests/ -v
 """
+import json
 import math
 import sys
 from pathlib import Path
@@ -257,3 +258,63 @@ def test_baseline_finds_a_dark_blob():
     (x1, y1, x2, y2), conf = dets[0]
     assert x1 < 320 < x2 and y1 < 380 < y2
     assert 0.0 < conf <= 1.0
+
+
+# ----------------------------------------------------------- geocoding ----
+def test_geocode_snaps_nearby_points_to_one_lookup():
+    from app.geocode import _snap
+    # Two defects ~20 m apart must resolve to the same grid cell, so the
+    # second costs no request.
+    a = _snap(51.45450, -2.58790)
+    b = _snap(51.45468, -2.58790)
+    assert a == b
+
+
+def test_geocode_describes_road_and_area():
+    from app.geocode import _describe
+    assert _describe({"road": "Whiteladies Road", "city": "Bristol"}) == \
+        "Whiteladies Road, Bristol"
+    assert _describe({"road": "Park Street"}) == "Park Street"
+    assert _describe({}) is None
+
+
+def test_geocode_never_raises_without_network(monkeypatch):
+    from app import geocode
+    monkeypatch.setattr(geocode, "_memo", {})
+    monkeypatch.setattr(geocode.urllib.request, "urlopen",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("offline")))
+    assert geocode.road_name(51.4545, -2.5879) is None
+
+
+def test_road_name_round_trips(db):
+    r = db.record_detection(51.4545, -2.5879, 0.8, 0.05, width_m=0.35, length_m=0.35)
+    assert db.potholes_missing_road_name()
+    db.set_road_name(r["id"], "Park Street, Bristol")
+    assert not db.potholes_missing_road_name()
+    assert db.all_potholes()[0]["road_name"] == "Park Street, Bristol"
+
+
+def test_geocode_parses_a_real_nominatim_reply(monkeypatch):
+    """Shape taken from a live jsonv2 reverse lookup, so the parser is tested
+    against what the service actually returns rather than what we assume."""
+    import io as _io
+    from contextlib import contextmanager
+    from app import geocode
+
+    payload = json.dumps({
+        "place_id": 1, "licence": "Data (C) OpenStreetMap contributors",
+        "lat": "51.454502", "lon": "-2.587903",
+        "display_name": "Whiteladies Road, Clifton, Bristol, England, BS8, UK",
+        "address": {"road": "Whiteladies Road", "suburb": "Clifton",
+                    "city": "Bristol", "postcode": "BS8",
+                    "country": "United Kingdom", "country_code": "gb"},
+    }).encode()
+
+    @contextmanager
+    def fake_urlopen(req, timeout=None):
+        yield _io.BytesIO(payload)
+
+    monkeypatch.setattr(geocode, "_memo", {})
+    monkeypatch.setattr(geocode, "MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(geocode.urllib.request, "urlopen", fake_urlopen)
+    assert geocode.road_name(51.454502, -2.587903) == "Whiteladies Road, Clifton"

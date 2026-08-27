@@ -32,6 +32,8 @@
   .btn{display:block;text-align:center;padding:11px;border-radius:10px;text-decoration:none;
     font-weight:600;font-size:14px;border:1px solid var(--line);color:var(--text);background:#0f151d}
   .btn.primary{background:var(--accent);color:#04120a;border-color:var(--accent)}
+  button.btn{width:100%;cursor:pointer;font-family:inherit}
+  button.btn:disabled{opacity:.55;cursor:default}
   ul{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:6px}
   li{background:#0f151d;border:1px solid var(--line);border-radius:9px;padding:9px 11px;
     font-size:13px;cursor:pointer}
@@ -63,6 +65,7 @@
     </div>
     <a class="btn primary" href="/api/export/pdf">Download council report (PDF)</a>
     <a class="btn" href="/api/export/csv">Export CSV</a>
+    <button class="btn" id="geo" type="button">Look up road names</button>
     <div>
       <div class="sub" style="margin-bottom:6px">Detected defects</div>
       <ul id="list"></ul>
@@ -71,7 +74,8 @@
   <div id="map"></div>
 </div>
 <script>
-const COLOURS = {high:'#f87171', medium:'#fbbf24', low:'#60a5fa'};
+const COLOURS = {high:'#f87171', medium:'#fbbf24', low:'#60a5fa', unknown:'#8b98a5'};
+const esc = t => String(t).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
 // The map is a progressive enhancement: if Leaflet or the tile server is
 // unavailable (offline laptop, blocked network) the statistics, defect list
@@ -93,8 +97,10 @@ let fitted = false;
 function popup(p){
   const img = p.evidence
     ? `<img src="/evidence/${p.evidence}" alt="evidence">` : '';
-  return `<b>PS-${String(p.id).padStart(5,'0')}</b><br>
-    Severity: <b style="color:${COLOURS[p.severity]}">${p.severity.toUpperCase()}</b><br>
+  const where = p.road_name ? `<br>${esc(p.road_name)}` : '';
+  const size = p.width_m ? ` · ${p.width_m.toFixed(2)} m wide` : '';
+  return `<b>PS-${String(p.id).padStart(5,'0')}</b>${where}<br>
+    Severity: <b style="color:${COLOURS[p.severity]||'#8b98a5'}">${p.severity.toUpperCase()}</b>${size}<br>
     Seen ${p.sightings}×, confidence ${p.max_conf.toFixed(2)}<br>
     <a href="https://www.google.com/maps?q=${p.lat},${p.lon}" target="_blank">Open in Maps ↗</a>
     ${img}`;
@@ -120,17 +126,22 @@ async function refresh(){
       if(!markers[p.id]){
         markers[p.id] = L.circleMarker([p.lat,p.lon], {
           radius: p.severity==='high'?11:p.severity==='medium'?8:6,
-          color:'#0b0f14', weight:2, fillColor:COLOURS[p.severity], fillOpacity:.9
+          color:'#0b0f14', weight:2,
+          fillColor:COLOURS[p.severity]||'#8b98a5', fillOpacity:.9
         }).addTo(layer);
       }
-      markers[p.id].setLatLng([p.lat,p.lon]).setStyle({fillColor:COLOURS[p.severity]});
+      markers[p.id].setLatLng([p.lat,p.lon])
+        .setStyle({fillColor:COLOURS[p.severity]||'#8b98a5'});
       markers[p.id].bindPopup(popup(p));
     }
 
     const li = document.createElement('li');
-    li.innerHTML = `<span class="ref"><span class="dot" style="background:${COLOURS[p.severity]}"></span>
-      PS-${String(p.id).padStart(5,'0')}</span>
-      <div class="meta">${p.lat.toFixed(5)}, ${p.lon.toFixed(5)} — ${p.severity}, seen ${p.sightings}×</div>`;
+    const place = p.road_name ? esc(p.road_name)
+                              : `${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}`;
+    const wide = p.width_m ? `${p.width_m.toFixed(2)} m` : 'not measured';
+    li.innerHTML = `<span class="ref"><span class="dot" style="background:${COLOURS[p.severity]||'#8b98a5'}"></span>
+      PS-${String(p.id).padStart(5,'0')} · ${place}</span>
+      <div class="meta">${p.severity}, ${wide}, seen ${p.sightings}×</div>`;
     li.onclick = () => {
       if(!map) return;
       map.setView([p.lat,p.lon], 18);
@@ -147,6 +158,22 @@ async function refresh(){
    console.error('refresh failed', err);
  }
 }
+// Reverse geocoding is one rate-limited request per road, so it runs on
+// demand after a drive rather than automatically while one is in progress.
+document.getElementById('geo').onclick = async (e) => {
+  const b = e.target;
+  b.disabled = true; b.textContent = 'Looking up road names…';
+  try {
+    const r = await fetch('/api/geocode', {method:'POST'}).then(r=>r.json());
+    b.textContent = r.considered
+      ? `Named ${r.named} of ${r.considered}` : 'All defects already named';
+    await refresh();
+  } catch (err) {
+    b.textContent = 'Lookup failed (offline?)';
+  }
+  setTimeout(() => { b.disabled = false; b.textContent = 'Look up road names'; }, 4000);
+};
+
 const k = (id,v) => document.getElementById(id).textContent = v;
 refresh();
 setInterval(refresh, 3000);   // live-updates while a survey is running

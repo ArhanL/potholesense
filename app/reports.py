@@ -17,7 +17,8 @@ from app import storage
 from app.severity import priority_rank
 
 CSV_COLUMNS = [
-    "reference", "latitude", "longitude", "severity", "width_m", "length_m",
+    "reference", "road_name", "latitude", "longitude", "severity",
+    "width_m", "length_m",
     "priority", "first_observed", "last_observed", "times_observed",
     "detector_confidence", "evidence_file", "google_maps_link",
 ]
@@ -28,6 +29,7 @@ def _rows(potholes: list[dict]) -> list[dict]:
     for p in potholes:
         rows.append({
             "reference": f"PS-{p['id']:05d}",
+            "road_name": p.get("road_name") or "",
             "latitude": round(p["lat"], 6),
             "longitude": round(p["lon"], 6),
             "severity": p["severity"],
@@ -86,27 +88,39 @@ def to_pdf(path: Path, potholes: list[dict] | None = None,
     story.append(Spacer(1, 6 * mm))
 
     counts = {s: sum(1 for r in rows if r["severity"] == s)
-              for s in ("high", "medium", "low")}
+              for s in ("high", "medium", "low", "unknown")}
     story.append(Paragraph(
         f"Severity breakdown &mdash; high: <b>{counts['high']}</b>, "
-        f"medium: <b>{counts['medium']}</b>, low: <b>{counts['low']}</b>.", body))
+        f"medium: <b>{counts['medium']}</b>, low: <b>{counts['low']}</b>, "
+        f"unclassified: <b>{counts['unknown']}</b>.", body))
     story.append(Spacer(1, 4 * mm))
     story.append(Paragraph(
-        "Severity is an automated estimate derived from the defect's apparent "
-        "size in frame and detector confidence, corroborated across repeat "
-        "sightings. It is advisory and does not replace physical inspection.",
-        small))
+        "Severity is banded on the defect's width measured on the road plane, "
+        "not on its apparent size in the image: <b>low</b> below 300&nbsp;mm, "
+        "<b>medium</b> 300&ndash;600&nbsp;mm, <b>high</b> above 600&nbsp;mm. "
+        "300&nbsp;mm is the surface width most commonly cited by UK highway "
+        "authorities as an intervention level, alongside a 40&nbsp;mm depth "
+        "criterion. <b>Depth is not measured</b> &mdash; it cannot be recovered "
+        "from a single camera &mdash; so these figures are advisory and do not "
+        "replace physical inspection. Defects recorded too far from the camera "
+        "to be measured reliably are listed as unclassified rather than "
+        "estimated.", small))
     story.append(Spacer(1, 6 * mm))
 
-    table_data = [["Ref", "Latitude", "Longitude", "Severity", "Seen", "Conf."]]
+    table_data = [["Ref", "Location", "Latitude", "Longitude", "Severity",
+                   "Width", "Seen"]]
     for r in rows:
         table_data.append([
-            r["reference"], f"{r['latitude']:.5f}", f"{r['longitude']:.5f}",
-            r["severity"].upper(), str(r["times_observed"]),
-            f"{r['detector_confidence']:.2f}",
+            r["reference"],
+            Paragraph(r["road_name"] or "&mdash;", small),
+            f"{r['latitude']:.5f}", f"{r['longitude']:.5f}",
+            r["severity"].upper(),
+            f"{r['width_m']:.2f} m" if r["width_m"] != "" else "—",
+            str(r["times_observed"]),
         ])
     t = Table(table_data, repeatRows=1, hAlign="LEFT",
-              colWidths=[22 * mm, 26 * mm, 26 * mm, 24 * mm, 16 * mm, 18 * mm])
+              colWidths=[20 * mm, 38 * mm, 23 * mm, 23 * mm, 22 * mm,
+                         18 * mm, 12 * mm])
     t.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2933")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
@@ -127,9 +141,11 @@ def to_pdf(path: Path, potholes: list[dict] | None = None,
             if not img_path.exists():
                 continue
             story.append(Spacer(1, 4 * mm))
+            where = f" &mdash; {r['road_name']}" if r["road_name"] else ""
+            size = f" &mdash; {r['width_m']:.2f} m wide" if r["width_m"] != "" else ""
             story.append(Paragraph(
-                f"<b>{r['reference']}</b> &mdash; {r['severity'].upper()} &mdash; "
-                f"{r['latitude']:.5f}, {r['longitude']:.5f} "
+                f"<b>{r['reference']}</b> &mdash; {r['severity'].upper()}{where}"
+                f"{size}<br/>{r['latitude']:.5f}, {r['longitude']:.5f} "
                 f"(<link href='{r['google_maps_link']}'>map</link>)", body))
             try:
                 story.append(RLImage(str(img_path), width=120 * mm, height=90 * mm,
