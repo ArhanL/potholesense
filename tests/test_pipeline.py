@@ -421,3 +421,69 @@ def test_synced_batch_is_idempotent(db):
     # The endpoint skips anything already present, so the second attempt is a
     # no-op rather than a duplicate sighting.
     assert db.stats()["detections"] == 1
+
+
+# ------------------------------------------------------------ migration ----
+# The original v1.0 schema, before width, road names, sessions on detections,
+# tracks or sync ids existed. Kept verbatim so the upgrade path is tested
+# against what people actually have on disk rather than against an assumption.
+_V1_SCHEMA = """
+CREATE TABLE potholes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, lat REAL NOT NULL, lon REAL NOT NULL,
+    first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+    sightings INTEGER NOT NULL DEFAULT 1, max_conf REAL NOT NULL,
+    area_fraction REAL NOT NULL, severity TEXT NOT NULL, evidence TEXT,
+    status TEXT NOT NULL DEFAULT 'new', session_id INTEGER);
+CREATE TABLE detections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, pothole_id INTEGER NOT NULL,
+    ts TEXT NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL,
+    confidence REAL NOT NULL, area_fraction REAL NOT NULL,
+    accuracy_m REAL, speed_mps REAL);
+CREATE TABLE sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL,
+    ended_at TEXT, device TEXT, frames INTEGER NOT NULL DEFAULT 0, notes TEXT);
+"""
+
+
+def test_an_existing_v1_database_upgrades_in_place(tmp_path, monkeypatch):
+    """A database written by the first release must open, keep its data, and
+    gain the new columns. Getting this wrong destroys a survey someone
+    already drove for, so it is tested rather than assumed."""
+    import sqlite3
+    from app import storage as st
+
+    db_file = tmp_path / "old.db"
+    con = sqlite3.connect(db_file)
+    con.executescript(_V1_SCHEMA)
+    con.execute("""INSERT INTO potholes
+                   (lat, lon, first_seen, last_seen, sightings, max_conf,
+                    area_fraction, severity)
+                   VALUES (51.4545, -2.5879, 'then', 'then', 3, 0.9, 0.02, 'low')""")
+    con.execute("""INSERT INTO detections
+                   (pothole_id, ts, lat, lon, confidence, area_fraction)
+                   VALUES (1, 'then', 51.4545, -2.5879, 0.9, 0.02)""")
+    con.commit()
+    con.close()
+
+    monkeypatch.setattr(st, "DB_PATH", db_file)
+    st.init_db()                      # must not raise "no such column"
+
+    with st.connect() as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(detections)")}
+        assert {"width_m", "length_m", "distance_m", "session_id",
+                "client_id"} <= cols
+        pcols = {r["name"] for r in conn.execute("PRAGMA table_info(potholes)")}
+        assert {"width_m", "length_m", "road_name"} <= pcols
+        # The old survey is still there.
+        assert conn.execute("SELECT COUNT(*) c FROM potholes").fetchone()["c"] == 1
+        assert conn.execute("SELECT COUNT(*) c FROM detections").fetchone()["c"] == 1
+        # And the new tables and indexes exist.
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='track'"
+        ).fetchone()
+        idx = {r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'")}
+        assert {"idx_detections_session", "idx_detections_client"} <= idx
+
+    # Running it twice must be a no-op, not an error.
+    st.init_db()

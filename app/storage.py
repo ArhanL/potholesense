@@ -53,10 +53,7 @@ CREATE TABLE IF NOT EXISTS detections (
     -- dropped connection cannot double-count a defect.
     client_id     TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_detections_session ON detections(session_id);
 CREATE INDEX IF NOT EXISTS idx_detections_pothole ON detections(pothole_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_detections_client
-    ON detections(client_id) WHERE client_id IS NOT NULL;
 
 -- Where the vehicle actually went, so a later survey can tell "this defect
 -- was not detected" (it may be gone) from "we never drove past it".
@@ -110,17 +107,29 @@ _MIGRATIONS = {
 }
 
 
+# Indexes over columns that _MIGRATIONS adds. These deliberately live here
+# rather than in SCHEMA: "CREATE TABLE IF NOT EXISTS" is a no-op against a
+# database made by an earlier version, so an index in SCHEMA would be built
+# before the ALTER TABLE that adds the column it references, and startup would
+# fail with "no such column" on exactly the databases migration exists to
+# rescue. Order matters - columns first, then anything that depends on them.
+_POST_MIGRATION_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_detections_session ON detections(session_id)",
+    # ALTER TABLE cannot add a UNIQUE constraint, so the idempotency guarantee
+    # for synced detections is carried by an index instead.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_detections_client "
+    "ON detections(client_id) WHERE client_id IS NOT NULL",
+)
+
+
 def _migrate(conn) -> None:
     for table, columns in _MIGRATIONS.items():
         have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
         for name, decl in columns.items():
             if name not in have:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
-    # ALTER TABLE cannot add a UNIQUE constraint, so the idempotency guarantee
-    # for synced detections is carried by an index that an upgraded database
-    # gets here and a fresh one gets from the schema.
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_detections_client "
-                 "ON detections(client_id) WHERE client_id IS NOT NULL")
+    for statement in _POST_MIGRATION_INDEXES:
+        conn.execute(statement)
 
 
 def init_db() -> None:
