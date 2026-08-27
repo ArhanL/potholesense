@@ -20,3 +20,6 @@ data/*.db-shm
 # Personal working notes, not part of the project
 CV_NOTES.md
 PLAN.md
+
+# Scratch: the OneDrive mount forbids unlink, so removals land here
+_to_delete/
