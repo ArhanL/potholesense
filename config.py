@@ -1,8 +1,13 @@
 """Central configuration for PotholeSense."""
+import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+
+# Where surveys are stored. Overridable so that tests - which wipe the
+# database between cases - can never touch real survey data. Set
+# POTHOLESENSE_DATA_DIR to a scratch directory before importing this module.
+DATA_DIR = Path(os.environ.get("POTHOLESENSE_DATA_DIR") or (BASE_DIR / "data"))
 EVIDENCE_DIR = DATA_DIR / "evidence"
 MODELS_DIR = BASE_DIR / "models"
 DB_PATH = DATA_DIR / "potholes.db"

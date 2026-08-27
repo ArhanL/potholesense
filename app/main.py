@@ -6,6 +6,7 @@ deduplicates defects geospatially, stores evidence and produces council reports.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -39,6 +40,18 @@ _stats = {"frames": 0, "infer_ms_total": 0.0, "detections": 0}
 def _startup():
     storage.init_db()
     log.info("Database ready at %s", DATA_DIR)
+
+    # Load the weights and run one dummy inference now, in the background.
+    # Otherwise the first frame of a real drive pays several seconds of lazy
+    # model initialisation - exactly when the car is already moving.
+    def _warm():
+        try:
+            get_detector().warmup()
+            log.info("Detector warm and ready")
+        except Exception as exc:                       # noqa: BLE001
+            log.warning("Detector warmup failed (%s); will load on first frame", exc)
+
+    threading.Thread(target=_warm, name="detector-warmup", daemon=True).start()
 
 
 # ---------------------------------------------------------------- pages ----
@@ -82,7 +95,7 @@ def session_end(session_id: int):
 
 # ----------------------------------------------------------------- frame ---
 @app.post("/api/frame")
-async def ingest_frame(
+def ingest_frame(
     image: UploadFile = File(...),
     lat: float = Form(...),
     lon: float = Form(...),
@@ -97,7 +110,7 @@ async def ingest_frame(
             {"skipped": "gps_accuracy", "accuracy_m": accuracy_m}, status_code=202
         )
 
-    raw = await image.read()
+    raw = image.file.read()
     frame = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
     if frame is None:
         raise HTTPException(400, "Could not decode image")
@@ -149,14 +162,25 @@ async def ingest_frame(
 
 # Last known position per session, used to derive heading when the phone's
 # own compass/course is unavailable (common at low speed or indoors).
+# Bounded: a long-running server would otherwise accumulate one entry per
+# session for the life of the process.
+_MAX_TRACKED_SESSIONS = 64
 _last_fix: dict[int, tuple[float, float]] = {}
 _last_heading: dict[int, float] = {}
+
+
+def _forget_oldest_sessions() -> None:
+    while len(_last_fix) > _MAX_TRACKED_SESSIONS:
+        oldest = next(iter(_last_fix))
+        _last_fix.pop(oldest, None)
+        _last_heading.pop(oldest, None)
 
 
 def _resolve_heading(session_id, lat, lon, reported):
     """Prefer the device's reported course; otherwise derive it from successive
     GPS fixes; otherwise reuse the last known heading."""
     key = session_id or 0
+    _forget_oldest_sessions()
     if reported is not None and not (isinstance(reported, float) and reported != reported):
         _last_heading[key] = reported
         _last_fix[key] = (lat, lon)
@@ -218,7 +242,8 @@ def ingest_detection(
         evidence=None, accuracy_m=accuracy_m, speed_mps=speed_mps,
         session_id=session_id,
     )
-    _stats["frames"] += 1
+    # Deliberately not counted as a frame: this endpoint receives one
+    # detection, not an image, so counting it would corrupt avg_inference_ms.
     _stats["detections"] += 1
     return {
         "pothole_id": rec["id"], "new": rec["created"],

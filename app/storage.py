@@ -6,7 +6,7 @@ duplicates, so every raw detection is matched against existing potholes within
 DEDUPE_RADIUS_M and merged if found.
 """
 import sqlite3
-import json
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -59,10 +59,21 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
-def connect() -> sqlite3.Connection:
+@contextmanager
+def connect():
+    """Open a connection, commit on success, and always close it.
+
+    sqlite3's own context manager commits or rolls back but does NOT close,
+    so the previous `with connect() as conn` leaked a file handle on every
+    call - thousands of them over a survey. This wraps both.
+    """
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db() -> None:

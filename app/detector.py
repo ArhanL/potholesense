@@ -18,6 +18,18 @@ from config import (WEIGHTS_PATH, FALLBACK_WEIGHTS, CONF_THRESHOLD,
 
 log = logging.getLogger("potholesense.detector")
 
+# Class names that count as a road defect. A fine-tuned pothole model emits
+# one of these; the stock COCO checkpoint emits "car", "person", "truck" and
+# so on, none of which are defects. Without this filter, running before
+# training turns every passing vehicle into a reported pothole.
+DEFECT_LABELS = {"pothole", "potholes", "pot-hole", "pot hole",
+                 "defect", "crack", "damage", "road_damage", "pothole_cv"}
+
+
+def is_defect(label: str) -> bool:
+    l = label.strip().lower().replace("-", " ")
+    return l in DEFECT_LABELS or "pothole" in l
+
 
 @dataclass
 class Detection:
@@ -86,15 +98,23 @@ class Detector:
             )
 
         out: list[Detection] = []
+        dropped = 0
         for r in results:
             names = r.names
             for box in r.boxes:
                 cls_id = int(box.cls[0])
                 label = names.get(cls_id, str(cls_id))
-                # When running on fine-tuned weights every class is a defect;
-                # on fallback weights nothing is, so we keep the raw label.
+                # A single-class fine-tuned model may name its one class
+                # anything, so accept everything when we know the weights are
+                # ours. On the stock checkpoint, keep only defect classes -
+                # otherwise cars and pedestrians get filed as potholes.
+                if self.using_fallback and not is_defect(label):
+                    dropped += 1
+                    continue
                 x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
                 out.append(Detection((x1, y1, x2, y2), float(box.conf[0]), label))
+        if dropped:
+            log.debug("Dropped %d non-defect detections from fallback weights", dropped)
         return out
 
     @staticmethod
