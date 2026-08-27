@@ -13,12 +13,13 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, Request, UploadFile, HTTPException
 from fastapi.responses import (FileResponse, HTMLResponse, PlainTextResponse,
                                JSONResponse)
 from fastapi.staticfiles import StaticFiles
 
-from config import EVIDENCE_DIR, DATA_DIR, MIN_GPS_ACCURACY_M, CONF_THRESHOLD
+from config import (EVIDENCE_DIR, DATA_DIR, MODELS_DIR, MIN_GPS_ACCURACY_M,
+                    CONF_THRESHOLD, ONNX_WEIGHTS_PATH)
 from app import storage, reports, geocode, survey
 from app.detector import get_detector
 from app.severity import bbox_area_fraction
@@ -30,8 +31,26 @@ log = logging.getLogger("potholesense")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
-app = FastAPI(title="PotholeSense", version="1.0.0")
+app = FastAPI(title="PotholeSense", version="1.1.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.middleware("http")
+async def cross_origin_isolation(request, call_next):
+    """Let the in-browser model runtime use more than one thread.
+
+    ONNX Runtime Web can only use SharedArrayBuffer - and therefore WASM
+    threads - in a cross-origin isolated page. These two headers grant that.
+    Everything the capture page loads is same-origin (the runtime, the model,
+    the page itself), so requiring corp costs nothing; the dashboard's map
+    tiles are cross-origin, which is why the header is not applied there.
+    """
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith(("/static/", "/models/")):
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+        response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
+        response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+    return response
 
 _stats = {"frames": 0, "infer_ms_total": 0.0, "detections": 0}
 
@@ -63,6 +82,31 @@ def index():
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     return (STATIC_DIR / "dashboard.html").read_text(encoding="utf-8")
+
+
+@app.get("/models/{name}")
+def model_file(name: str):
+    """Serve model weights to a client that runs inference itself.
+
+    The phone downloads this once over the hotspot and caches it, after which
+    a survey needs no laptop and no connection at all.
+    """
+    p = MODELS_DIR / Path(name).name
+    if p.suffix != ".onnx" or not p.exists():
+        raise HTTPException(404, "no such model")
+    return FileResponse(p, media_type="application/octet-stream",
+                        headers={"Cache-Control": "public, max-age=604800"})
+
+
+@app.get("/api/ondevice")
+def ondevice_status():
+    """Whether the phone can run the model itself, and with what."""
+    return {
+        "available": ONNX_WEIGHTS_PATH.exists(),
+        "model_url": f"/models/{ONNX_WEIGHTS_PATH.name}",
+        "bytes": ONNX_WEIGHTS_PATH.stat().st_size if ONNX_WEIGHTS_PATH.exists() else 0,
+        "conf_threshold": CONF_THRESHOLD,
+    }
 
 
 @app.get("/health")
@@ -266,6 +310,52 @@ def ingest_detection(
         "width_m": round(size.width_m, 2) if size.reliable else None,
         "range_reliable": gp.reliable,
     }
+
+
+@app.post("/api/sync")
+async def sync_offline(request: Request):
+    """Accept a batch of detections and track points recorded while offline.
+
+    A phone running the model itself has no reason to be in touch with this
+    server during a drive, and in a car it very often cannot be. It therefore
+    queues its results locally and posts them in one batch when it can, which
+    is also far cheaper than one request per detection.
+
+    The batch is idempotent by client_id: replaying it after a dropped
+    connection cannot double-count a pothole.
+    """
+    payload = await request.json()
+    session_id = payload.get("session_id")
+    accepted = duplicates = 0
+
+    for point in payload.get("track", []):
+        storage.record_track_point(session_id, point["lat"], point["lon"])
+
+    for d in payload.get("detections", []):
+        cid = d.get("client_id")
+        if cid and storage.detection_already_synced(cid):
+            duplicates += 1
+            continue
+        bbox = (d["x1"], d["y1"], d["x2"], d["y2"])
+        fw, fh = d["frame_w"], d["frame_h"]
+        heading = d.get("heading_deg")
+        p_lat, p_lon, _gp = locate_detection(bbox, fw, fh, d["lat"], d["lon"], heading)
+        size = measure_defect(bbox, fw, fh)
+        storage.record_detection(
+            lat=p_lat, lon=p_lon, confidence=d["confidence"],
+            area_fraction=bbox_area_fraction(bbox, fw, fh),
+            width_m=size.width_m or None, length_m=size.length_m or None,
+            distance_m=size.distance_m if size.reliable else None,
+            size_reliable=size.reliable, accuracy_m=d.get("accuracy_m"),
+            speed_mps=d.get("speed_mps"), session_id=session_id,
+            client_id=cid,
+        )
+        accepted += 1
+
+    log.info("Synced %d detections (%d duplicates) for session %s",
+             accepted, duplicates, session_id)
+    return {"accepted": accepted, "duplicates": duplicates,
+            "potholes": storage.stats()["potholes"]}
 
 
 @app.get("/evidence/{name}")

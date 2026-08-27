@@ -114,13 +114,51 @@ something.
 Everything on the server side is Python. The phone runs a small web page — no
 app install, no App Store, works on Android and iOS.
 
-**Why the model runs on the laptop, not the phone:** real-time camera inference
-*on* a phone needs a native Kotlin/Swift shell, which puts the project outside
-Python entirely. Offloading over a local hotspot keeps the whole system in one
-language while still giving live on-screen feedback at 3 fps. `POST /api/detection`
-already accepts detections computed elsewhere, so moving inference on-device
-later is a client change, not a rewrite — and the notebook exports ONNX/TFLite
-weights ready for it.
+## Running the model on the phone
+
+Streaming frames to a laptop means a laptop has to be in the car: powered, on
+the same network, for the whole drive. That is the version of this nobody uses
+twice. So the capture page offers two modes, and **on-device is the default**:
+
+```
+   PHONE                                    LAPTOP
+  ┌────────────────────────────────┐      ┌──────────────────────┐
+  │ capture.html                   │      │                      │
+  │  • rear camera @ 3 fps         │      │                      │
+  │  • YOLOv8n via ONNX Runtime Web│      │   (switched off)     │
+  │  • IPM-ready boxes, on device  │      │                      │
+  │  • queued in IndexedDB         │      │                      │
+  └────────────────────────────────┘      └──────────────────────┘
+                  │
+                  │  one batch, afterwards, when back in range
+                  ▼
+            POST /api/sync  →  same geometry, dedup, severity, reports
+```
+
+The model runs in the browser on the WebAssembly backend, cross-origin
+isolated so it can use several threads. Nothing about the server pipeline
+changes: the phone sends boxes in frame coordinates, and the same inverse
+perspective mapping, deduplication and severity banding run on them.
+
+Three things make it usable rather than a demo:
+
+**It works with no connection.** A service worker caches the page, the runtime
+and the weights the first time you open it in range. After that a survey needs
+nothing but the phone — which matters, because rural roads are exactly where
+the potholes and the notspots both are.
+
+**Results survive.** Detections and track points are written to IndexedDB, not
+held in a variable, so backgrounding the tab or a flat battery does not lose
+the drive. They upload in one batch afterwards.
+
+**Re-uploading is safe.** Every queued detection carries a client-minted id
+that the sync endpoint treats as unique, so a batch interrupted halfway and
+retried cannot double-count a pothole.
+
+No road imagery leaves the phone in this mode — only boxes and coordinates.
+
+Server mode is kept for a phone too slow to run the network, and because
+having both is what lets you measure what on-device inference actually costs.
 
 ## Quick start
 
@@ -192,7 +230,8 @@ and restart; `/health` confirms which weights loaded.
 ## Tests
 
 ```bash
-python -m pytest tests/ -v      # 51 tests: geometry, sizing, dedup, severity, diffing
+python -m pytest tests/ -v      # 53 tests, including the in-browser detector's
+                                #  coordinate maths via node
 ```
 
 ## Project layout
@@ -207,7 +246,10 @@ python -m pytest tests/ -v      # 51 tests: geometry, sizing, dedup, severity, d
 | `app/survey.py` | Repeat-survey differencing - new / worse / fixed |
 | `app/geocode.py` | Reverse geocoding - coordinate to road name |
 | `app/reports.py` | Council PDF dossier + CSV export |
-| `app/static/capture.html` | Phone client: camera, GPS, live overlay |
+| `app/static/capture.html` | Phone client: camera, GPS, live overlay, both modes |
+| `app/static/detector.js` | In-browser YOLOv8 - letterboxing, decode, NMS |
+| `app/static/queue.js` | IndexedDB queue for surveys recorded offline |
+| `app/static/sw.js` | Service worker - caches runtime + weights for offline |
 | `app/static/dashboard.html` | Live map, stats, exports |
 | `scripts/simulate_drive.py` | Closed-loop evaluation harness |
 
@@ -293,6 +335,9 @@ Stated plainly, because an interviewer will ask:
   rejected outright.
 - **No public-road validation yet.** All numbers above are from the synthetic
   harness. Real dashcam evaluation is the obvious next step.
+- **On-device inference is slower than the laptop.** WebAssembly on a phone is
+  not a desktop GPU; 3 fps is the design target, not a floor. The mode switch
+  exists partly so the two can be compared on the same drive.
 - **Not a legal reporting channel.** The report is a well-formatted submission
   aid; no council currently ingests it automatically.
 
@@ -307,5 +352,4 @@ you publish clips, blur faces and number plates.
 
 ## Roadmap
 
-- On-device TFLite inference (weights already export; `POST /api/detection` already accepts them)
 - Depth estimation for true severity, via monocular depth models or stereo from consecutive frames

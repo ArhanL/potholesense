@@ -44,6 +44,15 @@
   a{color:var(--accent)}
   .row{display:flex;gap:10px;align-items:center;justify-content:space-between;
     font-size:12px;color:var(--muted)}
+  .modes{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .mode{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:10px;font-size:13px;display:block;cursor:pointer}
+  .mode:has(input:checked){border-color:var(--accent)}
+  .mode:has(input:disabled){opacity:.45;cursor:not-allowed}
+  .mode input{margin:0 6px 0 0}
+  .mode b{font-weight:700}
+  .mode span{display:block;color:var(--muted);font-size:11px;margin-top:2px}
+  #queued:not(:empty){color:var(--warn);font-weight:600}
 </style>
 </head>
 <body>
@@ -64,11 +73,24 @@
     <span id="gps">GPS: waiting…</span>
     <a href="/dashboard" target="_blank">Open map ↗</a>
   </div>
+
+  <div class="modes">
+    <label class="mode"><input type="radio" name="mode" value="ondevice" checked>
+      <b>On this phone</b><span>No laptop needed. Works with no signal.</span></label>
+    <label class="mode"><input type="radio" name="mode" value="server">
+      <b>On the laptop</b><span>Streams frames over the network.</span></label>
+  </div>
+  <div class="row"><span id="modestate">Checking for an on-device model…</span>
+    <span id="queued"></span></div>
+
   <button id="go">Start survey</button>
   <div id="log"><div>Ready. Mount the phone before starting.</div></div>
 </div>
 
-<script>
+<script type="module">
+import { OnDeviceDetector } from '/static/detector.js';
+import * as queue from '/static/queue.js';
+
 const $ = id => document.getElementById(id);
 const video = $('cam'), overlay = $('overlay'), octx = overlay.getContext('2d');
 const grab = document.createElement('canvas'), gctx = grab.getContext('2d');
@@ -82,11 +104,68 @@ let fix = null, watchId = null, inflight = false;
 let sent = 0, fpsMark = performance.now(), fpsCount = 0;
 const seen = new Set();
 
+// On-device is the default when a model is available: it needs no laptop, no
+// hotspot, and never uploads road imagery. Server mode remains for a phone
+// too slow to run the network, and as the comparison for measuring what
+// on-device inference costs in latency.
+let mode = 'ondevice';
+let detector = null, localPotholes = 0, queuedCount = 0;
+const modeState = $('modestate');
+
 function log(msg){
   const d = document.createElement('div');
   d.textContent = new Date().toLocaleTimeString() + '  ' + msg;
   $('log').prepend(d);
   while ($('log').children.length > 60) $('log').lastChild.remove();
+}
+
+/* --- mode selection ---------------------------------------------------- */
+async function probeOnDevice(){
+  const radios = [...document.querySelectorAll('input[name=mode]')];
+  const onDeviceRadio = radios.find(r => r.value === 'ondevice');
+  try {
+    const info = await fetch('/api/ondevice').then(r => r.json());
+    if (!info.available){
+      onDeviceRadio.disabled = true;
+      radios.find(r => r.value === 'server').checked = true;
+      mode = 'server';
+      modeState.textContent =
+        'No on-device model yet — export ONNX from the notebook into models/';
+      return;
+    }
+    detector = new OnDeviceDetector({
+      modelUrl: info.model_url, confThreshold: info.conf_threshold });
+    modeState.textContent =
+      `Model ready (${(info.bytes/1e6).toFixed(1)} MB) — downloads once, then works offline`;
+  } catch (e) {
+    onDeviceRadio.disabled = true;
+    mode = 'server';
+    modeState.textContent = 'Could not reach the server to check for a model';
+  }
+}
+
+document.querySelectorAll('input[name=mode]').forEach(r => {
+  r.onchange = () => { mode = r.value; };
+});
+
+async function ensureModelLoaded(){
+  if (!detector || detector.ready) return;
+  modeState.textContent = 'Loading model…';
+  const info = await detector.load((got, total) => {
+    modeState.textContent = total
+      ? `Downloading model ${(100*got/total).toFixed(0)}%`
+      : `Downloading model ${(got/1e6).toFixed(1)} MB`;
+  });
+  modeState.textContent =
+    `Running on this phone · ${info.threads} thread${info.threads>1?'s':''}`;
+}
+
+async function updateQueued(){
+  try {
+    const { detections } = await queue.pending();
+    queuedCount = detections.length;
+    $('queued').textContent = queuedCount ? `${queuedCount} to upload` : '';
+  } catch (e) { /* storage unavailable: the drive still works */ }
 }
 
 async function startCamera(){
@@ -129,43 +208,83 @@ function flash(){
   setTimeout(()=>$('hit').classList.remove('show'), 450);
 }
 
+/* --- the two survey paths ---------------------------------------------- */
+
+/* On-device: infer here, keep the imagery on the phone, queue the result.
+ * Nothing here needs the network, so the drive is unaffected by losing it. */
+async function stepOnDevice(){
+  const { boxes, inferenceMs, frameW, frameH } = await detector.detect(video);
+  $('s-ms').textContent = inferenceMs.toFixed(0);
+  drawBoxes(boxes.map(b => ({...b, severity: '', confidence: b.confidence.toFixed(2)})),
+            frameW, frameH);
+
+  await queue.queueTrackPoint({
+    lat: fix.latitude, lon: fix.longitude, accuracy_m: fix.accuracy ?? null });
+
+  for (const b of boxes){
+    await queue.queueDetection({
+      client_id: queue.newId(),
+      lat: fix.latitude, lon: fix.longitude,
+      x1: b.bbox[0], y1: b.bbox[1], x2: b.bbox[2], y2: b.bbox[3],
+      frame_w: frameW, frame_h: frameH,
+      confidence: b.confidence,
+      accuracy_m: fix.accuracy ?? null,
+      speed_mps: Number.isFinite(fix.speed) ? fix.speed : null,
+      heading_deg: Number.isFinite(fix.heading) ? fix.heading : null,
+    });
+    localPotholes++;
+    flash();
+  }
+  // Counted locally because deduplication happens server-side at sync: this
+  // is raw sightings, and the map will show the true number of defects.
+  $('s-found').textContent = localPotholes;
+  await updateQueued();
+}
+
+/* Server: upload the frame and let the laptop run the model. */
+async function stepServer(){
+  const scale = SEND_WIDTH / video.videoWidth;
+  grab.width = SEND_WIDTH; grab.height = Math.round(video.videoHeight*scale);
+  gctx.drawImage(video, 0, 0, grab.width, grab.height);
+  const blob = await new Promise(r => grab.toBlob(r, 'image/jpeg', JPEG_Q));
+
+  const fd = new FormData();
+  fd.append('image', blob, 'f.jpg');
+  fd.append('lat', fix.latitude);
+  fd.append('lon', fix.longitude);
+  if (fix.accuracy != null) fd.append('accuracy_m', fix.accuracy);
+  if (fix.speed != null && !isNaN(fix.speed)) fd.append('speed_mps', fix.speed);
+  if (fix.heading != null && !isNaN(fix.heading)) fd.append('heading_deg', fix.heading);
+  if (sessionId) fd.append('session_id', sessionId);
+
+  const res = await fetch('/api/frame', { method:'POST', body: fd });
+  if (res.status === 202) return;                 // GPS too coarse
+  const data = await res.json();
+
+  $('s-ms').textContent = data.inference_ms;
+  drawBoxes(data.detections, data.frame.w, data.frame.h);
+
+  data.detections.forEach(d => {
+    if (d.new){
+      seen.add(d.pothole_id);
+      $('s-found').textContent = seen.size;
+      flash();
+      const rng = d.distance_m != null ? ` @${d.distance_m}m ahead` : '';
+      const size = d.width_m != null ? `, ${d.width_m}m wide` : '';
+      log(`NEW #${d.pothole_id} ${d.severity}${size}${rng}`);
+    }
+  });
+}
+
 async function sendFrame(){
   if (!running || inflight || !fix || video.readyState < 2) return;
   inflight = true;
   try{
-    const scale = SEND_WIDTH / video.videoWidth;
-    grab.width = SEND_WIDTH; grab.height = Math.round(video.videoHeight*scale);
-    gctx.drawImage(video, 0, 0, grab.width, grab.height);
-    const blob = await new Promise(r => grab.toBlob(r, 'image/jpeg', JPEG_Q));
-
-    const fd = new FormData();
-    fd.append('image', blob, 'f.jpg');
-    fd.append('lat', fix.latitude);
-    fd.append('lon', fix.longitude);
-    if (fix.accuracy != null) fd.append('accuracy_m', fix.accuracy);
-    if (fix.speed != null && !isNaN(fix.speed)) fd.append('speed_mps', fix.speed);
-    if (fix.heading != null && !isNaN(fix.heading)) fd.append('heading_deg', fix.heading);
-    if (sessionId) fd.append('session_id', sessionId);
-
-    const res = await fetch('/api/frame', { method:'POST', body: fd });
-    if (res.status === 202){ inflight=false; return; }   // GPS too coarse
-    const data = await res.json();
-
+    if (mode === 'ondevice') await stepOnDevice();
+    else await stepServer();
     sent++; fpsCount++;
-    $('s-ms').textContent = data.inference_ms;
-    drawBoxes(data.detections, data.frame.w, data.frame.h);
-
-    data.detections.forEach(d => {
-      if (d.new){
-        seen.add(d.pothole_id);
-        $('s-found').textContent = seen.size;
-        flash();
-        const rng = d.distance_m != null ? ` @${d.distance_m}m ahead` : '';
-        log(`NEW #${d.pothole_id} ${d.severity} conf ${d.confidence}${rng}`);
-      }
-    });
   } catch(err){
-    log('upload failed: ' + err.message);
+    log((mode === 'ondevice' ? 'inference failed: ' : 'upload failed: ') + err.message);
   } finally { inflight = false; }
 }
 
@@ -179,11 +298,22 @@ setInterval(() => {
 
 async function start(){
   try{
+    if (mode === 'ondevice') await ensureModelLoaded();
     await startCamera();
     startGPS();
-    const fd = new FormData();
-    fd.append('device', navigator.userAgent.slice(0,120));
-    sessionId = (await (await fetch('/api/session/start',{method:'POST',body:fd})).json()).session_id;
+    // A session id is only obtainable while the server is reachable. On-device
+    // surveys start before the drive, in range; if the server cannot be
+    // reached at all the survey still runs and syncs into a session created
+    // at upload time.
+    try{
+      const fd = new FormData();
+      fd.append('device', navigator.userAgent.slice(0,120));
+      sessionId = (await (await fetch('/api/session/start',{method:'POST',body:fd})).json()).session_id;
+    }catch(e){
+      if (mode !== 'ondevice') throw e;
+      sessionId = null;
+      log('server unreachable — recording offline');
+    }
     if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen').catch(()=>null);
     running = true;
     $('go').textContent = 'Stop survey'; $('go').classList.add('stop');
@@ -199,19 +329,53 @@ function loop(){
   setTimeout(loop, 1000/TARGET_FPS);
 }
 
+async function syncNow(){
+  const b = $('go');
+  try{
+    await updateQueued();
+    if (!queuedCount) return;
+    b.disabled = true;
+    log(`uploading ${queuedCount} detections…`);
+    const r = await queue.flush(sessionId);
+    log(`synced — ${r.accepted} recorded, ${r.duplicates||0} already had, `
+        + `${r.potholes} distinct potholes`);
+  }catch(err){
+    log('sync failed, survey kept on the phone: ' + err.message);
+  }finally{
+    b.disabled = false;
+    await updateQueued();
+  }
+}
+
 async function stop(){
   running = false;
-  if (sessionId) await fetch(`/api/session/${sessionId}/end`, {method:'POST'});
+  if (sessionId) await fetch(`/api/session/${sessionId}/end`, {method:'POST'}).catch(()=>{});
   if (watchId != null) navigator.geolocation.clearWatch(watchId);
   if (stream) stream.getTracks().forEach(t => t.stop());
   if (wakeLock) { try{ await wakeLock.release(); }catch(e){} wakeLock = null; }
   octx.clearRect(0,0,overlay.width,overlay.height);
   $('go').textContent = 'Start survey'; $('go').classList.remove('stop');
   $('dot').classList.remove('live'); $('state').textContent = 'idle';
-  log(`stopped — ${sent} frames, ${seen.size} potholes`);
+  log(`stopped — ${sent} frames, ${mode==='ondevice'?localPotholes:seen.size} sightings`);
+  if (mode === 'ondevice') await syncNow();
 }
 
 $('go').onclick = () => running ? stop() : start();
+
+// Cache the page, the runtime and the weights, so the next drive needs
+// nothing but the phone. Registration is best-effort: a browser without
+// service workers still surveys, it just cannot do so offline.
+if ('serviceWorker' in navigator){
+  navigator.serviceWorker.register('/static/sw.js', { scope: '/' })
+    .catch(err => log('offline mode unavailable: ' + err.message));
+}
+
+// A survey left unsynced from a previous drive uploads as soon as the phone
+// is back in range of the server.
+window.addEventListener('online', () => { if (!running) syncNow(); });
+
+probeOnDevice();
+updateQueued();
 </script>
 </body>
 </html>

@@ -392,3 +392,32 @@ def test_growth_threshold_adapts_to_measurement_spread(db):
     tight = _mean_and_sem([0.40, 0.40, 0.41, 0.40, 0.40])
     noisy = _mean_and_sem([0.30, 0.50, 0.35, 0.48, 0.38])
     assert noisy[1] > tight[1]
+
+
+# --------------------------------------------------- on-device / syncing ----
+def test_javascript_detector_tests_pass():
+    """The phone runs the model itself, so its coordinate maths is part of the
+    pipeline and belongs in the same test command. Skipped where node is not
+    installed rather than silently ignored."""
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not installed - run tests/test_detector.mjs manually")
+    root = Path(__file__).resolve().parent.parent
+    r = subprocess.run([node, str(root / "tests" / "test_detector.mjs")],
+                       capture_output=True, text=True, cwd=root)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_synced_batch_is_idempotent(db):
+    """A phone that loses its connection mid-upload retries the whole batch.
+    Replaying it must not record the same pothole twice."""
+    record = dict(lat=51.4545, lon=-2.5879, confidence=0.9, area_fraction=0.01,
+                  width_m=0.4, length_m=0.4, client_id="abc-123")
+    db.record_detection(**record)
+    assert db.detection_already_synced("abc-123")
+    assert not db.detection_already_synced("never-seen")
+    # The endpoint skips anything already present, so the second attempt is a
+    # no-op rather than a duplicate sighting.
+    assert db.stats()["detections"] == 1

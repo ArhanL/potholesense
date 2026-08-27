@@ -48,10 +48,15 @@ CREATE TABLE IF NOT EXISTS detections (
     distance_m    REAL,
     accuracy_m    REAL,
     speed_mps     REAL,
-    session_id    INTEGER
+    session_id    INTEGER,
+    -- Identifier minted by an offline client, so replaying a batch after a
+    -- dropped connection cannot double-count a defect.
+    client_id     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_detections_session ON detections(session_id);
 CREATE INDEX IF NOT EXISTS idx_detections_pothole ON detections(pothole_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_detections_client
+    ON detections(client_id) WHERE client_id IS NOT NULL;
 
 -- Where the vehicle actually went, so a later survey can tell "this defect
 -- was not detected" (it may be gone) from "we never drove past it".
@@ -101,7 +106,7 @@ def connect():
 _MIGRATIONS = {
     "potholes": {"width_m": "REAL", "length_m": "REAL", "road_name": "TEXT"},
     "detections": {"width_m": "REAL", "length_m": "REAL", "distance_m": "REAL",
-                   "session_id": "INTEGER"},
+                   "session_id": "INTEGER", "client_id": "TEXT"},
 }
 
 
@@ -111,6 +116,11 @@ def _migrate(conn) -> None:
         for name, decl in columns.items():
             if name not in have:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    # ALTER TABLE cannot add a UNIQUE constraint, so the idempotency guarantee
+    # for synced detections is carried by an index that an upgraded database
+    # gets here and a fresh one gets from the schema.
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_detections_client "
+                 "ON detections(client_id) WHERE client_id IS NOT NULL")
 
 
 def init_db() -> None:
@@ -202,6 +212,7 @@ def record_detection(
     accuracy_m: float | None = None,
     speed_mps: float | None = None,
     session_id: int | None = None,
+    client_id: str | None = None,
     evidence_writer=None,
 ) -> dict:
     """Insert a detection, merging into an existing pothole when nearby.
@@ -279,10 +290,12 @@ def record_detection(
         conn.execute(
             """INSERT INTO detections
                (pothole_id, ts, lat, lon, confidence, area_fraction,
-                width_m, length_m, distance_m, accuracy_m, speed_mps, session_id)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                width_m, length_m, distance_m, accuracy_m, speed_mps,
+                session_id, client_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (pothole_id, _now(), lat, lon, confidence, area_fraction,
-             width_m, length_m, distance_m, accuracy_m, speed_mps, session_id),
+             width_m, length_m, distance_m, accuracy_m, speed_mps,
+             session_id, client_id),
         )
         row = conn.execute("SELECT * FROM potholes WHERE id=?", (pothole_id,)).fetchone()
         return {"created": created, **dict(row)}
@@ -367,6 +380,12 @@ def width_samples_in_session(pothole_id: int, session_id: int) -> list[float]:
 def mean_width_in_session(pothole_id: int, session_id: int) -> float | None:
     samples = width_samples_in_session(pothole_id, session_id)
     return sum(samples) / len(samples) if samples else None
+
+
+def detection_already_synced(client_id: str) -> bool:
+    with connect() as conn:
+        return conn.execute("SELECT 1 FROM detections WHERE client_id=?",
+                            (client_id,)).fetchone() is not None
 
 
 def all_potholes(status: str | None = None) -> list[dict]:

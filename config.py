@@ -18,6 +18,10 @@ DB_PATH = DATA_DIR / "potholes.db"
 WEIGHTS_PATH = MODELS_DIR / "pothole_yolov8n.pt"
 FALLBACK_WEIGHTS = "yolov8n.pt"
 
+# Same network exported to ONNX, served to the phone so it can run inference
+# itself. Optional: without it the phone streams frames to this server instead.
+ONNX_WEIGHTS_PATH = MODELS_DIR / "pothole_yolov8n.onnx"
+
 # Inference
 CONF_THRESHOLD = 0.45      # min confidence to accept a detection
 IOU_THRESHOLD = 0.50
