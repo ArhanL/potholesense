@@ -1,11 +1,12 @@
 # PotholeSense - core dependencies
-ultralytics==8.3.*          # YOLO training + inference
+ultralytics==8.3.*           # YOLO training + inference
 opencv-python-headless==4.*  # image decode / draw
 fastapi==0.115.*             # API + serves the phone client
 uvicorn[standard]==0.32.*    # ASGI server
 python-multipart==0.0.*      # multipart frame uploads
 jinja2==3.1.*                # dashboard templating
 reportlab==4.*               # council PDF report
-cryptography              # self-signed TLS cert (no openssl needed on Windows)
+requests==2.*                # used by scripts/simulate_drive.py
+cryptography                 # self-signed TLS cert (no openssl needed on Windows)
 numpy
 Pillow

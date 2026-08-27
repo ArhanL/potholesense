@@ -183,9 +183,21 @@ python -m venv .venv; .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 
 # Try it with no model and no car - run these in two terminals:
-$env:POTHOLESENSE_STUB=1; python run.py
+$env:POTHOLESENSE_STUB=1
+python run.py
 python scripts/simulate_drive.py --frames 220 --potholes 10 --oracle
 start http://localhost:8000/dashboard
+```
+
+PowerShell has no `&&`: run each line separately, and set `$env:POTHOLESENSE_STUB`
+in the same terminal as `run.py`.
+
+`requirements.txt` pulls in PyTorch, which is a large download. Stub mode and
+the whole evaluation harness do not use it, so to try the system first:
+
+```powershell
+pip install fastapi "uvicorn[standard]" python-multipart opencv-python-headless `
+            reportlab requests cryptography numpy pillow jinja2
 ```
 
 If PowerShell blocks the activate script, run

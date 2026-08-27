@@ -1,0 +1,3 @@
+# Test dependencies. Not needed to run a survey.
+-r requirements.txt
+pytest==8.*
