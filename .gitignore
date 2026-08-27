@@ -12,6 +12,11 @@ runs/
 yolov8n.pt
 docs_sample_report.pdf
 
+# SQLite side-car files
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+
 # Personal working notes, not part of the project
 CV_NOTES.md
 PLAN.md

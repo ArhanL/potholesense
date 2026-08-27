@@ -1,0 +1,20 @@
+# Normalise line endings so a Windows checkout does not show every file as modified.
+* text=auto eol=lf
+
+*.py      text eol=lf
+*.md      text eol=lf
+*.html    text eol=lf
+*.css     text eol=lf
+*.js      text eol=lf
+*.txt     text eol=lf
+*.sh      text eol=lf
+*.ipynb   text eol=lf
+
+*.png     binary
+*.jpg     binary
+*.pdf     binary
+*.pt      binary
+*.onnx    binary
+
+# Vendored third-party assets: leave byte-for-byte as shipped.
+app/static/vendor/** -text
