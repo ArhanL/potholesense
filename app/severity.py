@@ -17,6 +17,7 @@ a wide shallow patch and a narrow deep hole are not distinguished. That
 limitation is stated rather than hidden, because a council prioritising work
 has to be able to justify the ordering.
 """
+from __future__ import annotations
 from config import SEVERITY_WIDTH_BANDS_M, SEVERITY_MAX_RANGE_M
 
 

@@ -1,4 +1,25 @@
 """Central configuration for PotholeSense."""
+import sys
+
+# Fail with an explanation rather than a TypeError deep in an import.
+# The codebase uses PEP 604 annotations (`float | None`), and FastAPI resolves
+# route annotations at runtime, so they cannot be deferred with
+# `from __future__ import annotations`. macOS still ships 3.9 as `python3`,
+# which is where this bites: the error you would otherwise get is
+# "unsupported operand type(s) for |: 'type' and 'NoneType'", which says
+# nothing about the actual problem.
+if sys.version_info < (3, 10):
+    raise RuntimeError(
+        f"PotholeSense needs Python 3.10 or newer; this is "
+        f"{sys.version_info.major}.{sys.version_info.minor} at {sys.executable}.\n"
+        "On macOS the system python3 is 3.9. Install a newer one and rebuild "
+        "the virtual environment:\n"
+        "    brew install python@3.12\n"
+        "    rm -rf .venv && python3.12 -m venv .venv\n"
+        "    source .venv/bin/activate\n"
+        "    pip install -r requirements.txt"
+    )
+
 import os
 from pathlib import Path
 

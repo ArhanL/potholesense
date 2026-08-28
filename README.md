@@ -162,6 +162,12 @@ having both is what lets you measure what on-device inference actually costs.
 
 ## Quick start
 
+**Python 3.10 or newer.** FastAPI resolves route annotations at runtime and
+they use `float | None`, so 3.9 cannot run this. That matters most on macOS,
+where the system `python3` is still 3.9 - check with `python3 --version`, and
+if it is older, `brew install python@3.12` and build the virtual environment
+with `python3.12 -m venv .venv`.
+
 **macOS / Linux**
 
 ```bash

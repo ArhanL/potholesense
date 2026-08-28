@@ -5,6 +5,7 @@ the same defect. Writing each as a separate report would flood the council with
 duplicates, so every raw detection is matched against existing potholes within
 DEDUPE_RADIUS_M and merged if found.
 """
+from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone

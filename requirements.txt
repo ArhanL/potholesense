@@ -1,4 +1,5 @@
 # PotholeSense - core dependencies
+# Requires Python 3.10 or newer (PEP 604 annotations in FastAPI routes).
 ultralytics==8.3.*           # YOLO training + inference
 opencv-python-headless==4.*  # image decode / draw
 fastapi==0.115.*             # API + serves the phone client

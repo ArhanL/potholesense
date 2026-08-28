@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import config          # noqa: F401  - imported for its Python version check
+
 CERT_DIR = Path(__file__).parent / "data" / "certs"
 
 
