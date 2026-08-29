@@ -1,10 +1,14 @@
-# PotholeSense - core dependencies
+# PotholeSense - what the server and the evaluation harness need.
 # Requires Python 3.10 or newer (PEP 604 annotations in FastAPI routes).
-ultralytics==8.3.*           # YOLO training + inference
-opencv-python-headless==4.*  # image decode / draw
+#
+# Note what is NOT here: ultralytics/PyTorch. app/detector.py imports YOLO
+# lazily, so the server, the simulator, the dashboard and the reports all run
+# without it. Installing a multi-gigabyte deep-learning stack just to try the
+# system out is a poor trade - see requirements-model.txt for when you need it.
 fastapi==0.115.*             # API + serves the phone client
 uvicorn[standard]==0.32.*    # ASGI server
 python-multipart==0.0.*      # multipart frame uploads
+opencv-python-headless==4.*  # image decode / draw
 jinja2==3.1.*                # dashboard templating
 reportlab==4.*               # council PDF report
 requests==2.*                # used by scripts/simulate_drive.py

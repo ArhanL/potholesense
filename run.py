@@ -4,8 +4,15 @@
 Usage:
     python run.py                 # http on all interfaces, port 8000
     python run.py --https         # self-signed TLS (needed for phone GPS/camera)
+    python run.py --https --stub  # no model needed - classical CV stand-in
+
+Identical on Windows, macOS and Linux. Options are flags rather than
+environment variables on purpose: `$env:X=1` and `export X=1` are not the
+same thing, and having to remember which shell you are in is a needless way
+to get stuck.
 """
 import argparse
+import os
 import socket
 import subprocess
 import sys
@@ -109,7 +116,15 @@ def main():
     ap.add_argument("--https", action="store_true",
                     help="serve over TLS - required for camera/GPS on a phone")
     ap.add_argument("--reload", action="store_true")
+    ap.add_argument("--stub", action="store_true",
+                    help="run the classical-CV stand-in instead of a trained "
+                         "model - lets the whole pipeline be demoed before "
+                         "any weights exist")
     args = ap.parse_args()
+
+    # Must be set before app.main imports the detector.
+    if args.stub:
+        os.environ["POTHOLESENSE_STUB"] = "1"
 
     import uvicorn
     kwargs = dict(host=args.host, port=args.port, reload=args.reload)
@@ -119,11 +134,15 @@ def main():
         kwargs.update(ssl_keyfile=str(key), ssl_certfile=str(crt))
         scheme = "https"
 
+    stub = os.getenv("POTHOLESENSE_STUB", "").lower() in ("1", "true", "yes")
     ip = lan_ip()
     print("\n" + "=" * 58)
-    print("  PotholeSense")
+    print("  PotholeSense" + ("   [STUB - no trained model]" if stub else ""))
     print(f"  Phone (capture):  {scheme}://{ip}:{args.port}/")
     print(f"  Laptop (map):     {scheme}://{ip}:{args.port}/dashboard")
+    if scheme == "http":
+        print("  NOTE: the phone needs --https; browsers block camera and GPS")
+        print("        over plain http from anything but localhost.")
     print("=" * 58 + "\n")
     uvicorn.run("app.main:app", **kwargs)
 

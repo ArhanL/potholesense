@@ -1,0 +1,5 @@
+# Needed only to run a trained model server-side, or to train one.
+# Not needed for stub mode, the simulator, the tests, or on-device inference
+# (the phone runs ONNX Runtime Web in the browser - no Python involved).
+-r requirements.txt
+ultralytics==8.3.*

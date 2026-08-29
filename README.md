@@ -162,54 +162,63 @@ having both is what lets you measure what on-device inference actually costs.
 
 ## Quick start
 
-**Python 3.10 or newer.** FastAPI resolves route annotations at runtime and
-they use `float | None`, so 3.9 cannot run this. That matters most on macOS,
-where the system `python3` is still 3.9 - check with `python3 --version`, and
-if it is older, `brew install python@3.12` and build the virtual environment
-with `python3.12 -m venv .venv`.
+One command, the same on every machine. It builds the virtual environment if
+there isn't one, installs what's missing, and starts the server.
 
 **macOS / Linux**
 
 ```bash
-git clone <your-repo> && cd potholesense
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-# Try it with no model and no car:
-POTHOLESENSE_STUB=1 python run.py &
-python scripts/simulate_drive.py --frames 220 --potholes 10 --oracle
-open http://localhost:8000/dashboard
+git clone https://github.com/ArhanL/potholesense && cd potholesense
+./dev.sh                       # server, with the classical-CV stand-in
+./dev.sh --test                # 54 tests
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-git clone <your-repo>; cd potholesense
-python -m venv .venv; .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-
-# Try it with no model and no car - run these in two terminals:
-$env:POTHOLESENSE_STUB=1
-python run.py
-python scripts/simulate_drive.py --frames 220 --potholes 10 --oracle
-start http://localhost:8000/dashboard
+git clone https://github.com/ArhanL/potholesense; cd potholesense
+.\dev.ps1                      # server, with the classical-CV stand-in
+.\dev.ps1 -Test                # 54 tests
 ```
 
-PowerShell has no `&&`: run each line separately, and set `$env:POTHOLESENSE_STUB`
-in the same terminal as `run.py`.
+If PowerShell refuses to run the script, allow it for this session only:
+`Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`.
 
-`requirements.txt` pulls in PyTorch, which is a large download. Stub mode and
-the whole evaluation harness do not use it, so to try the system first:
+Then, with the server running, drive a virtual car past ten potholes:
 
-```powershell
-pip install fastapi "uvicorn[standard]" python-multipart opencv-python-headless `
-            reportlab requests cryptography numpy pillow jinja2
+```bash
+./dev.sh --sim                 # .\dev.ps1 -Sim on Windows
 ```
 
-If PowerShell blocks the activate script, run
-`Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` first.
-No `openssl` needed on any platform - the TLS certificate is generated in
-pure Python.
+and open `https://localhost:8000/dashboard`.
+
+**Requirements:** Python 3.10 or newer — FastAPI resolves route annotations at
+runtime and they use `float | None`. macOS still ships 3.9 as `python3`;
+`dev.sh` looks for a newer one and tells you where to get it if there isn't
+one. Note that PyTorch is *not* installed by default: `app/detector.py` imports
+YOLO lazily, so the server, simulator, dashboard and reports all work without
+it. Only `--real` / `-Real` pulls the model stack in.
+
+## Working on two machines
+
+The project is meant to be moved between machines with **git**, not with a
+file-sync folder. A virtual environment contains binaries compiled for one
+operating system, so a synced `.venv` will be overwritten by whichever machine
+saved last and then fail with errors that point at the wrong OS entirely.
+
+Two conventions keep that from happening:
+
+- Each platform gets its own environment — `.venv-win` and `.venv-mac`. Both
+  are gitignored, both are created automatically, and neither can clobber the
+  other even inside a synced folder.
+- Options are command-line flags, not environment variables, because
+  `$env:X=1` and `export X=1` are not interchangeable and remembering which
+  shell you are in is a needless way to get stuck.
+
+The one thing to avoid is keeping the working copy inside OneDrive, Dropbox or
+iCloud Drive. Clone it somewhere local on each machine and move work with
+`git push` / `git pull`; sync folders and git are two answers to the same
+question, and running both causes exactly the collisions git exists to manage.
 
 ### Real driving
 
@@ -270,6 +279,7 @@ python -m pytest tests/ -v      # 53 tests, including the in-browser detector's
 | `app/static/sw.js` | Service worker - caches runtime + weights for offline |
 | `app/static/dashboard.html` | Live map, stats, exports |
 | `scripts/simulate_drive.py` | Closed-loop evaluation harness |
+| `dev.sh` / `dev.ps1` | One-command setup and run, per platform |
 
 ## Driving the same road again
 
